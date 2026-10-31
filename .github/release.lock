@@ -1,0 +1,15 @@
+# Generated release train for Unka-Malloc/Fairlead.
+# Regenerate instead of editing: records which engine revision and
+# which source inputs produced the generated files beside it.
+[generator]
+engine = "release-engine"
+version = "0.1.0"
+
+[source]
+templates = "sha256:06393619887472e73b95773b77a1fa86143e32a90b5e9c0818c260d5093379a9"
+declaration = "sha256:67d4129ced387e280122e0a6e16966a906f68b91486307ce46536e25159fae9e"
+
+[outputs]
+".github/workflows/verify.yml" = "sha256:00aa795f0ab089b8a021db06dba910e3393a1daedddce35b6401628d8765c193"
+".github/workflows/publish.yml" = "sha256:ece82fad7e364c9c7c570c5e4ca61c06e3ca9b8725e0b1aba437866113c33a4a"
+".github/release.py" = "sha256:9d73a3b660dfbefda496c692201c1d488735b3ddfecd7eadc03abf892f11ddf8"
