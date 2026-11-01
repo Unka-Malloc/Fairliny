@@ -17,20 +17,28 @@
 //! Nothing here touches credential material: the router hands the adapter
 //! a resolver, the lease answers, and only refusal codes travel back.
 
-use std::io::{BufRead, Read as _, Write};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinSet;
 
-use crate::meter::Meter;
-use crate::router::{BoundRoute, Router, auth_label};
+use crate::meter::{Meter, UsageKeyStyle, usage_object};
+use crate::router::{BoundRoute, Router, auth_label, protocol_label};
 use crate::{Error, Result};
 
 /// Upper bound on one request line. A line past it is hostile input, not
 /// a request: answered `id: null`, its remainder discarded through the
 /// next newline without ever being buffered.
 pub const MAX_LINE_BYTES: usize = 1024 * 1024;
+
+/// The default deadline on one upstream call. Provider hangs are
+/// indistinguishable from very slow answers at the transport layer, so
+/// the bound is generous — six hundred seconds is far past a healthy
+/// buffered completion — and `upstreamDeadlineSecs` overrides it in the
+/// routes document; `0` means the host accepts an unbounded wait.
+pub const DEFAULT_UPSTREAM_DEADLINE: Duration = Duration::from_secs(600);
 
 /// What one [`read_capped_line`] call produced.
 enum InputLine {
@@ -46,11 +54,18 @@ enum InputLine {
 /// through a `Take` so a line without a newline can never buffer past
 /// the cap; an oversized line's remainder is then skipped a buffer at a
 /// time, so the discard is bounded too.
-fn read_capped_line(input: &mut impl BufRead, line: &mut Vec<u8>) -> std::io::Result<InputLine> {
-    if input
-        .by_ref()
+///
+/// Async so the loop yields while it waits for input — settlement tasks
+/// stay pollable between requests rather than stalling behind a blocking
+/// stdin read.
+async fn read_capped_line(
+    input: &mut (impl AsyncBufRead + Unpin),
+    line: &mut Vec<u8>,
+) -> std::io::Result<InputLine> {
+    if (&mut *input)
         .take(MAX_LINE_BYTES as u64 + 1)
-        .read_until(b'\n', line)?
+        .read_until(b'\n', line)
+        .await?
         == 0
     {
         return Ok(InputLine::Eof);
@@ -63,7 +78,7 @@ fn read_capped_line(input: &mut impl BufRead, line: &mut Vec<u8>) -> std::io::Re
     }
     line.clear();
     loop {
-        let available = input.fill_buf()?;
+        let available = input.fill_buf().await?;
         if available.is_empty() {
             return Ok(InputLine::Oversized);
         }
@@ -84,9 +99,11 @@ fn read_capped_line(input: &mut impl BufRead, line: &mut Vec<u8>) -> std::io::Re
 pub struct Service {
     router: Router,
     meter: Arc<Meter>,
-    /// Settlement tasks spawned beside replies — tracked so a host (or a
-    /// test) can drain them deterministically instead of racing the
-    /// journal.
+    /// The deadline one upstream call gets, or `None` for an unbounded
+    /// wait — see [`DEFAULT_UPSTREAM_DEADLINE`].
+    upstream_deadline: Option<Duration>,
+    /// Settlement tasks spawned beside replies — reaped as they finish
+    /// so the set holds live work, never one retained task per request.
     settle: Mutex<JoinSet<()>>,
 }
 
@@ -96,8 +113,19 @@ impl Service {
         Self {
             router,
             meter: Arc::new(meter),
+            upstream_deadline: Some(DEFAULT_UPSTREAM_DEADLINE),
             settle: Mutex::new(JoinSet::new()),
         }
+    }
+
+    /// Set the deadline one upstream call gets: the forwarded request
+    /// errors with `upstream_deadline` once the provider call outlives
+    /// it, so one hung provider cannot stall the whole gateway. `None`
+    /// restores the caller-cancels model for hosts that bound the call
+    /// themselves.
+    pub fn with_upstream_deadline(mut self, deadline: Option<Duration>) -> Self {
+        self.upstream_deadline = deadline;
+        self
     }
 
     pub fn router(&self) -> &Router {
@@ -108,13 +136,39 @@ impl Service {
         &self.meter
     }
 
+    /// Settlement tasks currently retained — live work plus whatever the
+    /// next dispatch has not reaped yet. The observable bound on the
+    /// task set.
+    pub fn settle_len(&self) -> usize {
+        self.settle.lock().map(|tasks| tasks.len()).unwrap_or(0)
+    }
+
+    /// Reap settlement tasks that already finished: the tracked set
+    /// stays proportional to live settlement work instead of growing
+    /// one entry per forwarded request for the process lifetime. A
+    /// panicked settlement counts as a metering failure like any other.
+    fn reap_settlements(&self) {
+        let Ok(mut tasks) = self.settle.lock() else {
+            self.meter.count_failure();
+            return;
+        };
+        while let Some(result) = tasks.try_join_next() {
+            if result.is_err() {
+                self.meter.count_failure();
+            }
+        }
+    }
+
     /// One request, one reply. The reply never depends on the settlement
     /// that follows it — dispatch is the per-request unit of work.
     pub async fn dispatch(&self, id: Value, method: Option<&str>, params: &Value) -> Value {
+        // Finished settlement tasks are reaped on the way in, so the
+        // tracked set never grows past live work.
+        self.reap_settlements();
         match method {
             Some("models.list") => reply(id, self.models_list()),
             Some("chat.complete") => reply(id, self.chat_complete(params).await),
-            Some("metrics.exposition") => reply(id, self.metrics_exposition()),
+            Some("metrics.exposition") => reply(id, self.metrics_exposition().await),
             _ => error_reply(id, "unknown method"),
         }
     }
@@ -123,34 +177,36 @@ impl Service {
     /// continue. Returns on EOF or a stream error; a malformed, oversized
     /// or non-UTF-8 line is a per-request `id: null` error, never a fatal
     /// one, and the loop is ready for the next line.
+    ///
+    /// Input is awaited, never blocked on — an idle sidecar waiting for
+    /// the next line still yields to the settlement tasks the replies
+    /// spawned.
     pub async fn serve(
         &self,
-        mut input: impl BufRead,
-        mut output: impl Write,
+        mut input: impl AsyncBufRead + Unpin,
+        mut output: impl AsyncWrite + Unpin,
     ) -> std::io::Result<()> {
         let mut line = Vec::new();
         loop {
             line.clear();
-            match read_capped_line(&mut input, &mut line)? {
+            match read_capped_line(&mut input, &mut line).await? {
                 InputLine::Eof => return Ok(()),
                 InputLine::Oversized => {
-                    writeln!(
-                        output,
-                        "{}",
-                        json!({"id": null, "error": format!("bad request line: exceeds {MAX_LINE_BYTES} bytes")})
-                    )?;
-                    output.flush()?;
+                    write_line(
+                        &mut output,
+                        &json!({"id": null, "error": format!("bad request line: exceeds {MAX_LINE_BYTES} bytes")}),
+                    )
+                    .await?;
                     continue;
                 }
                 InputLine::Complete => {}
             }
             let Ok(text) = std::str::from_utf8(&line) else {
-                writeln!(
-                    output,
-                    "{}",
-                    json!({"id": null, "error": "bad request line: not utf-8"})
-                )?;
-                output.flush()?;
+                write_line(
+                    &mut output,
+                    &json!({"id": null, "error": "bad request line: not utf-8"}),
+                )
+                .await?;
                 continue;
             };
             if text.trim().is_empty() {
@@ -159,12 +215,11 @@ impl Service {
             let request: Value = match serde_json::from_str(text) {
                 Ok(value) => value,
                 Err(error) => {
-                    writeln!(
-                        output,
-                        "{}",
-                        json!({"id": null, "error": format!("bad request line: {error}")})
-                    )?;
-                    output.flush()?;
+                    write_line(
+                        &mut output,
+                        &json!({"id": null, "error": format!("bad request line: {error}")}),
+                    )
+                    .await?;
                     continue;
                 }
             };
@@ -172,25 +227,32 @@ impl Service {
             let method = request.get("method").and_then(Value::as_str);
             let params = request.get("params").cloned().unwrap_or(Value::Null);
             let reply = self.dispatch(id, method, &params).await;
-            writeln!(output, "{reply}")?;
-            output.flush()?;
+            write_line(&mut output, &reply).await?;
         }
     }
 
-    /// Drain pending settlement tasks. The forward path never needs it —
-    /// this is how a host (or a test) observes a settled journal instead
-    /// of racing it.
+    /// Drain pending settlement tasks and persist the counters. The
+    /// forward path never needs it — this is how a host (or a test, or
+    /// the exposition before it answers) observes a settled journal
+    /// instead of racing it.
     pub async fn flush_metering(&self) {
-        let mut tasks = {
-            let Ok(mut guard) = self.settle.lock() else {
+        let drained = match self.settle.lock() {
+            Ok(mut guard) => Some(std::mem::replace(&mut *guard, JoinSet::new())),
+            Err(_) => {
                 // A poisoned task set is a metering failure like any
                 // other — counted, never propagated.
                 self.meter.count_failure();
-                return;
-            };
-            std::mem::replace(&mut *guard, JoinSet::new())
+                None
+            }
         };
-        while tasks.join_next().await.is_some() {}
+        if let Some(mut tasks) = drained {
+            while let Some(result) = tasks.join_next().await {
+                if result.is_err() {
+                    self.meter.count_failure();
+                }
+            }
+        }
+        self.meter.flush();
     }
 
     /// The bound route table as a projection — a config answer, not a
@@ -219,7 +281,8 @@ impl Service {
     }
 
     /// Forward one chat request: resolve the route, count the admission,
-    /// call the adapter, spawn the settlement beside the reply.
+    /// call the adapter under the upstream deadline, spawn the settlement
+    /// beside the reply.
     async fn chat_complete(&self, params: &Value) -> Result<Value> {
         let model = params
             .get("model")
@@ -230,14 +293,28 @@ impl Service {
             .get("agent")
             .and_then(Value::as_str)
             .unwrap_or("stdio");
-        // Admission is the accept event: a resolved route means the gateway
-        // took the request, whatever the provider answers next.
-        self.meter.admit_request(agent, model);
+        // Admission is the accept event: the request exists only once it
+        // parses — a payload the gateway rejects is never counted as
+        // forwarded traffic.
         let request = chat_request(&bound.upstream_model, params)?;
-        let output = bound
-            .adapter
-            .chat(request, &a4mp::RequestControl::default())
-            .await?;
+        self.meter.admit_request(agent, model);
+        let control = a4mp::RequestControl::default();
+        let output = match self.upstream_deadline {
+            Some(deadline) => {
+                match tokio::time::timeout(deadline, bound.adapter.chat(request, &control)).await {
+                    Ok(output) => output?,
+                    Err(_) => {
+                        // The provider call is dead work now: cancel it and
+                        // let the caller decide whether the request retries —
+                        // one hung upstream never becomes an unbounded outage
+                        // of the whole gateway.
+                        control.cancel.cancel();
+                        return Err(Error::UpstreamDeadline(deadline));
+                    }
+                }
+            }
+            None => bound.adapter.chat(request, &control).await?,
+        };
         // Settlement is ordered after the response exists and runs on its
         // own task: the reply never waits on the journal.
         let meter = Arc::clone(&self.meter);
@@ -255,13 +332,25 @@ impl Service {
         Ok(output_json(&bound, &output))
     }
 
-    /// The exposition text a host mounts at `/metrics`.
-    fn metrics_exposition(&self) -> Result<Value> {
+    /// The exposition text a host mounts at `/metrics`. Pending
+    /// settlements drain before the projection so a scrape that follows
+    /// a forward sees the settled counters, not a mid-flight journal.
+    async fn metrics_exposition(&self) -> Result<Value> {
+        self.flush_metering().await;
         Ok(json!({
             "contentType": crate::export::CONTENT_TYPE,
             "exposition": crate::export::render(self.meter())?,
         }))
     }
+}
+
+/// One reply line on the wire: the serialized object plus its newline,
+/// written and flushed as one await pair.
+async fn write_line(output: &mut (impl AsyncWrite + Unpin), value: &Value) -> std::io::Result<()> {
+    let mut line = value.to_string();
+    line.push('\n');
+    output.write_all(line.as_bytes()).await?;
+    output.flush().await
 }
 
 /// A reply carrying a result or the error text — the aor.rs convention:
@@ -401,35 +490,14 @@ fn stop_label(stop: &a4mp::StopReason) -> String {
 }
 
 /// Usage on the wire: the canonical counters plus every provider-native
-/// field — absent counters stay absent, they are never zeroed.
+/// field — absent counters stay absent, they are never zeroed. Shares
+/// [`usage_object`] with the settlement record so an extension key can
+/// never overwrite a real count in either projection.
 fn usage_json(usage: &Option<a4mp::Usage>) -> Value {
-    let Some(usage) = usage else {
-        return Value::Null;
-    };
-    let mut object = Map::new();
-    if let Some(input) = usage.input_tokens {
-        object.insert("inputTokens".to_owned(), input.into());
-    }
-    if let Some(output) = usage.output_tokens {
-        object.insert("outputTokens".to_owned(), output.into());
-    }
-    for (key, value) in &usage.extensions {
-        object.insert(key.clone(), value.clone());
-    }
-    Value::Object(object)
-}
-
-/// The protocol name `models.list` reports — a stable label, not the enum.
-fn protocol_label(protocol: &a4mp::Protocol) -> String {
-    match protocol {
-        a4mp::Protocol::OpenAiChatCompletions => "openai-chat-completions".to_owned(),
-        a4mp::Protocol::OpenAiResponses => "openai-responses".to_owned(),
-        a4mp::Protocol::AnthropicMessages => "anthropic-messages".to_owned(),
-        a4mp::Protocol::GeminiGenerateContent => "gemini-generate-content".to_owned(),
-        a4mp::Protocol::BedrockConverse => "bedrock-converse".to_owned(),
-        a4mp::Protocol::Other(name) => format!("other:{name}"),
-        _ => "other".to_owned(),
-    }
+    usage
+        .as_ref()
+        .map(|usage| Value::Object(usage_object(usage, UsageKeyStyle::Reply)))
+        .unwrap_or(Value::Null)
 }
 
 #[cfg(test)]
@@ -464,8 +532,8 @@ mod tests {
         assert!(chat_request("m", &json!({"messages": [{}]})).is_err());
     }
 
-    #[test]
-    fn capped_reads_bound_a_hostile_line_and_recover() {
+    #[tokio::test]
+    async fn capped_reads_bound_a_hostile_line_and_recover() {
         // A line that runs past the cap never buffers whole: the read
         // stops at the bound and the remainder is skipped to the newline.
         let mut bytes = vec![b'x'; MAX_LINE_BYTES + 8];
@@ -473,19 +541,19 @@ mod tests {
         let mut input = &bytes[..];
         let mut line = Vec::new();
         assert!(matches!(
-            read_capped_line(&mut input, &mut line).expect("read"),
+            read_capped_line(&mut input, &mut line).await.expect("read"),
             InputLine::Oversized
         ));
         assert!(line.is_empty());
         // The next read starts on the following line — the oversized
         // line's tail did not leak into it.
         assert!(matches!(
-            read_capped_line(&mut input, &mut line).expect("read"),
+            read_capped_line(&mut input, &mut line).await.expect("read"),
             InputLine::Complete
         ));
         assert_eq!(line, b"{\"id\":1}\n");
         assert!(matches!(
-            read_capped_line(&mut input, &mut line).expect("read"),
+            read_capped_line(&mut input, &mut line).await.expect("read"),
             InputLine::Eof
         ));
 
@@ -494,17 +562,17 @@ mod tests {
         let mut input = &tail[..];
         line.clear();
         assert!(matches!(
-            read_capped_line(&mut input, &mut line).expect("read"),
+            read_capped_line(&mut input, &mut line).await.expect("read"),
             InputLine::Oversized
         ));
         assert!(matches!(
-            read_capped_line(&mut input, &mut line).expect("read"),
+            read_capped_line(&mut input, &mut line).await.expect("read"),
             InputLine::Eof
         ));
     }
 
-    #[test]
-    fn capped_reads_accept_the_boundary_and_eof_lines() {
+    #[tokio::test]
+    async fn capped_reads_accept_the_boundary_and_eof_lines() {
         // The cap counts the newline: content at the bound plus its
         // terminator is still a complete line.
         let mut bytes = vec![b'x'; MAX_LINE_BYTES - 1];
@@ -512,7 +580,7 @@ mod tests {
         let mut input = &bytes[..];
         let mut line = Vec::new();
         assert!(matches!(
-            read_capped_line(&mut input, &mut line).expect("read"),
+            read_capped_line(&mut input, &mut line).await.expect("read"),
             InputLine::Complete
         ));
         assert_eq!(line.len(), MAX_LINE_BYTES);
@@ -521,13 +589,42 @@ mod tests {
         line.clear();
         let mut input = &b"final-line-without-newline"[..];
         assert!(matches!(
-            read_capped_line(&mut input, &mut line).expect("read"),
+            read_capped_line(&mut input, &mut line).await.expect("read"),
             InputLine::Complete
         ));
         assert_eq!(line, b"final-line-without-newline");
         assert!(matches!(
-            read_capped_line(&mut input, &mut line).expect("read"),
+            read_capped_line(&mut input, &mut line).await.expect("read"),
             InputLine::Eof
         ));
+    }
+
+    #[test]
+    fn reply_usage_extensions_cannot_overwrite_the_canonical_counts() {
+        // The reply projection carries the same canonical-key guard the
+        // settlement record does — a provider extension naming
+        // `inputTokens` never replaces the counted value.
+        let mut extensions = serde_json::Map::new();
+        extensions.insert("inputTokens".to_owned(), 999.into());
+        extensions.insert("cacheReadInputTokens".to_owned(), 7.into());
+        let usage = usage_json(&Some(a4mp::Usage {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            extensions,
+        }));
+        assert_eq!(usage["inputTokens"], json!(10));
+        assert_eq!(usage["outputTokens"], json!(5));
+        assert_eq!(usage["cacheReadInputTokens"], json!(7));
+
+        // A provider-native field naming an absent counter still
+        // forwards under its own spelling — nothing was overwritten.
+        let mut extensions = serde_json::Map::new();
+        extensions.insert("inputTokens".to_owned(), 9.into());
+        let usage = usage_json(&Some(a4mp::Usage {
+            input_tokens: None,
+            output_tokens: None,
+            extensions,
+        }));
+        assert_eq!(usage["inputTokens"], json!(9));
     }
 }

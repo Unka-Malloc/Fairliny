@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use a4mp::{Adapter, AuthKind, AuthSpec, CredentialResolver, Protocol, ProviderId, Transport};
+use serde_json::Value;
 
 use crate::{Error, Result};
 
@@ -36,6 +37,50 @@ pub struct Route {
     /// The identifier the upstream call receives. May differ from the
     /// outward name so aliases never leak deployment naming upstream.
     pub upstream_model: String,
+}
+
+impl Route {
+    /// Parse one routes-document entry `{model, provider, upstreamModel?,
+    /// protocol?, region?, auth?}` into the outward name and its route.
+    /// The protocol and auth vocabulary is the same table `models.list`
+    /// renders and errors quote: every label the gateway emits is a label
+    /// the document accepts.
+    pub fn from_document(entry: &Value) -> Result<(String, Self)> {
+        let invalid = |field: &str| Error::Request(format!("route entry requires a valid {field}"));
+        let model = entry
+            .get("model")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("model"))?
+            .to_owned();
+        let provider = entry
+            .get("provider")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("provider"))?;
+        let protocol = entry
+            .get("protocol")
+            .and_then(Value::as_str)
+            .map(parse_protocol)
+            .transpose()?;
+        let auth = parse_auth(entry.get("auth").and_then(Value::as_str).unwrap_or("none"))?;
+        let upstream_model = entry
+            .get("upstreamModel")
+            .and_then(Value::as_str)
+            .unwrap_or(&model)
+            .to_owned();
+        Ok((
+            model,
+            Self {
+                provider: ProviderId::new(provider),
+                protocol,
+                region: entry
+                    .get("region")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                auth,
+                upstream_model,
+            },
+        ))
+    }
 }
 
 /// A resolved route: the bound adapter and what the upstream call is for.
@@ -109,6 +154,22 @@ impl Router {
             });
         }
         self.routes.insert(model, route);
+        Ok(())
+    }
+
+    /// Load a routes document `{"routes":[{model,provider,...}]}`.
+    /// A malformed entry refuses the whole table — the gateway never
+    /// silently runs half a route table.
+    pub fn load_routes(&mut self, document: &Value) -> Result<()> {
+        let empty = Vec::new();
+        let routes = document
+            .get("routes")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty);
+        for entry in routes {
+            let (model, route) = Route::from_document(entry)?;
+            self.add_route(model, route)?;
+        }
         Ok(())
     }
 
@@ -191,7 +252,54 @@ fn accepts(specs: &[AuthSpec], auth: &AuthKind) -> bool {
     })
 }
 
+/// The protocol labels `models.list` renders, back to the enum — one
+/// table both directions share. Named variants carry a stable label; a
+/// provider-native protocol and any variant the table does not name emit
+/// `other:<name>`, a spelling [`parse_protocol`] always accepts — every
+/// label the gateway emits is a label the routes document parses.
+const PROTOCOL_VOCABULARY: &[(&str, Protocol)] = &[
+    ("openai-chat-completions", Protocol::OpenAiChatCompletions),
+    ("openai-responses", Protocol::OpenAiResponses),
+    ("anthropic-messages", Protocol::AnthropicMessages),
+    ("gemini-generate-content", Protocol::GeminiGenerateContent),
+    ("bedrock-converse", Protocol::BedrockConverse),
+];
+
+/// The protocol name `models.list` reports — a stable label, not the enum.
+pub fn protocol_label(protocol: &Protocol) -> String {
+    if let Some((label, _)) = PROTOCOL_VOCABULARY
+        .iter()
+        .find(|(_, known)| known == protocol)
+    {
+        return (*label).to_owned();
+    }
+    match protocol {
+        Protocol::Other(name) => format!("other:{name}"),
+        other => format!("other:{other:?}"),
+    }
+}
+
+/// The protocol labels `models.list` reports, back to the enum. `other:x`
+/// declares the provider-native protocol `x` — the same spelling
+/// [`protocol_label`] emits for `Protocol::Other`.
+pub fn parse_protocol(label: &str) -> Result<Protocol> {
+    if let Some((_, protocol)) = PROTOCOL_VOCABULARY
+        .iter()
+        .find(|(known, _)| *known == label)
+    {
+        return Ok(protocol.clone());
+    }
+    match label.strip_prefix("other:") {
+        Some(name) => Ok(Protocol::Other(name.to_owned())),
+        None => Err(Error::Request(format!("unknown protocol {label:?}"))),
+    }
+}
+
 /// The mechanism name projections and errors may show.
+///
+/// A mechanism the table does not name emits `other:<name>` — the same
+/// spelling [`parse_auth`] reads back, so the label never describes a
+/// route the document could not declare.
 pub fn auth_label(auth: &AuthKind) -> String {
     match auth {
         AuthKind::None => "none".to_owned(),
@@ -199,7 +307,27 @@ pub fn auth_label(auth: &AuthKind) -> String {
         AuthKind::Bearer => "bearer".to_owned(),
         AuthKind::CloudIdentity { service } => format!("cloud:{service}"),
         AuthKind::External { client } => format!("external:{client}"),
-        _ => "other".to_owned(),
+        other => format!("other:{other:?}"),
+    }
+}
+
+/// The auth labels `models.list` reports, back to the kind. `other:x`
+/// declares a mechanism outside the named kinds; the only way to bind
+/// one is the named external client the profile must still accept.
+pub fn parse_auth(label: &str) -> Result<AuthKind> {
+    match label {
+        "none" => Ok(AuthKind::None),
+        "api-key" => Ok(AuthKind::ApiKey),
+        "bearer" => Ok(AuthKind::Bearer),
+        _ => match label.split_once(':') {
+            Some(("cloud", service)) => Ok(AuthKind::CloudIdentity {
+                service: service.to_owned(),
+            }),
+            Some(("external" | "other", client)) => Ok(AuthKind::External {
+                client: client.to_owned(),
+            }),
+            _ => Err(Error::Request(format!("unknown auth {label:?}"))),
+        },
     }
 }
 
@@ -227,5 +355,74 @@ mod tests {
                 client: "b".to_owned()
             }
         ));
+    }
+
+    #[test]
+    fn the_vocabulary_round_trips_every_label_it_emits() {
+        // Named variants carry stable labels in both directions.
+        for (label, protocol) in PROTOCOL_VOCABULARY {
+            assert_eq!(protocol_label(protocol), *label);
+            assert_eq!(parse_protocol(label).ok().as_ref(), Some(protocol));
+        }
+        for (label, auth) in [
+            ("none", AuthKind::None),
+            ("api-key", AuthKind::ApiKey),
+            ("bearer", AuthKind::Bearer),
+            (
+                "cloud:services:govcloud",
+                AuthKind::CloudIdentity {
+                    service: "services:govcloud".to_owned(),
+                },
+            ),
+            (
+                "external:acme.sso",
+                AuthKind::External {
+                    client: "acme.sso".to_owned(),
+                },
+            ),
+        ] {
+            assert_eq!(auth_label(&auth), label);
+            // Parsed kinds have no `PartialEq`; the label read back from
+            // the parse is the total-mapped check.
+            assert_eq!(auth_label(&parse_auth(label).expect(label)), label);
+        }
+        // `other:` spellings emit and parse under the same rule — a
+        // provider-native protocol keeps its name; an unnamed auth
+        // mechanism binds as the named external client it declares.
+        assert_eq!(
+            parse_protocol(&protocol_label(&Protocol::Other("ollama".to_owned()))).expect("other"),
+            Protocol::Other("ollama".to_owned())
+        );
+        assert_eq!(
+            auth_label(&parse_auth("other:acme").expect("auth")),
+            "external:acme"
+        );
+        assert!(parse_protocol("made-up-protocol").is_err());
+        assert!(parse_auth("made-up-auth").is_err());
+    }
+
+    #[test]
+    fn a_document_entry_parses_or_refuses_as_one_piece() {
+        let (model, route) = Route::from_document(&serde_json::json!({
+            "model": "chat",
+            "provider": "ollama",
+            "upstreamModel": "llama3.1",
+            "protocol": "other:ollama",
+            "auth": "none"
+        }))
+        .expect("entry");
+        assert_eq!(model, "chat");
+        assert_eq!(route.upstream_model, "llama3.1");
+        assert_eq!(route.protocol, Some(Protocol::Other("ollama".to_owned())));
+
+        // A missing required field or an unknown vocabulary word refuses
+        // the entry — never a half-parsed route.
+        for entry in [
+            serde_json::json!({"provider": "ollama"}),
+            serde_json::json!({"model": "m", "provider": "ollama", "auth": "oauth-magic"}),
+            serde_json::json!({"model": "m", "provider": "ollama", "protocol": "grpc"}),
+        ] {
+            assert!(Route::from_document(&entry).is_err(), "{entry}");
+        }
     }
 }
