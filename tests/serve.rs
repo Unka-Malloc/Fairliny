@@ -565,8 +565,10 @@ fn the_routes_document_refuses_malformed_entries_and_loads_well_formed_ones() {
             .is_err()
     );
     // A runtime-supplied endpoint is part of the route: a local profile
-    // carries no address of its own, so a route without one cannot bind.
-    router
+    // carries no address of its own, so a route without the variable is
+    // refused at declaration — the error names the missing variable,
+    // not a deferred bind failure at first forward.
+    let error = router
         .load_routes(&serde_json::json!({
             "routes": [{
                 "model": "local-chat",
@@ -576,7 +578,8 @@ fn the_routes_document_refuses_malformed_entries_and_loads_well_formed_ones() {
                 "auth": "none"
             }]
         }))
-        .expect("routes");
+        .expect_err("a route missing its endpoint variable refuses");
+    assert!(error.to_string().contains("{endpoint}"), "{error}");
     assert!(router.resolve("local-chat").is_err());
     router
         .load_routes(&serde_json::json!({

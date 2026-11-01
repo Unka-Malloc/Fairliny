@@ -6,7 +6,7 @@
 //! sockets, the custody, and the epoch file it rotates to revoke.
 //!
 //! The routes document is `{"upstreamDeadlineSecs"?: 600,
-//! "routes":[{model,provider,upstreamModel?,protocol?,region?,auth?}]}` —
+//! "routes":[{model,provider,upstreamModel?,protocol?,region?,auth?,vars?}]}` —
 //! the deadline bounds one upstream call (`0` waits unbounded), and a
 //! malformed entry refuses startup rather than running half a table.
 
