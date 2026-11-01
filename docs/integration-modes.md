@@ -79,12 +79,13 @@ The routes document is one object:
   `auth` (default `none`) is the mechanism the lease must answer —
   `none`, `api-key`, `bearer`, `cloud:<service>` or `external:<client>`.
   A malformed entry refuses startup rather than running half a table.
-- `vars` (default `{}`) supplies the profile's runtime variables —
-  `{name}` placeholders in its service target. Local profiles carry no
-  built-in address: their endpoint is supplied here per route,
-  e.g. `"vars": {"endpoint": "<base URL>"}`. A route whose variables do
-  not resolve the whole target refuses to bind rather than leaking a
-  template.
+- `routes[].vars` (default `{}`) supplies the profile's runtime
+  variables — `{name}` placeholders in its service target. Local
+  profiles carry no built-in address: their endpoint is supplied here
+  per route, e.g. `"vars": {"endpoint": "<base URL>"}`. A route whose
+  variables do not resolve the whole target is refused at declaration —
+  startup fails on the entry rather than deferring the template error
+  to the first forwarded request.
 - `upstreamDeadlineSecs` bounds one upstream provider call so a hung
   provider cannot stall the gateway — default `600`, `0` restores an
   unbounded wait for hosts that bound the call themselves.

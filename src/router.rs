@@ -46,7 +46,8 @@ pub struct Route {
 
 impl Route {
     /// Parse one routes-document entry `{model, provider, upstreamModel?,
-    /// protocol?, region?, auth?}` into the outward name and its route.
+    /// protocol?, region?, auth?, vars?}` into the outward name and its
+    /// route.
     /// The protocol and auth vocabulary is the same table `models.list`
     /// renders and errors quote: every label the gateway emits is a label
     /// the document accepts.
@@ -76,12 +77,14 @@ impl Route {
             .get("vars")
             .map(|v| {
                 v.as_object()
-                    .map(|m| {
-                        m.iter()
-                            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_owned()))
-                            .collect()
+                    .ok_or_else(|| invalid("vars"))?
+                    .iter()
+                    .map(|(k, v)| {
+                        v.as_str()
+                            .map(|value| (k.clone(), value.to_owned()))
+                            .ok_or_else(|| invalid(&format!("vars.{k}")))
                     })
-                    .ok_or_else(|| invalid("vars"))
+                    .collect()
             })
             .transpose()?
             .unwrap_or_default();
@@ -150,8 +153,11 @@ impl Router {
     /// Bind an outward model name to a catalog provider surface.
     ///
     /// Fails closed at declaration time: the provider must resolve through
-    /// the catalog and the profile must accept the declared auth mechanism,
-    /// so a typo'd route is refused before traffic ever reaches it.
+    /// the catalog, the profile must accept the declared auth mechanism,
+    /// and the declared variables must materialize the profile's target
+    /// template — the same bind `resolve` performs is run once here, so a
+    /// typo'd provider, mechanism or variable key is refused before
+    /// traffic ever reaches the route, not at first `chat.complete`.
     pub fn add_route(&mut self, model: impl Into<String>, route: Route) -> Result<()> {
         let model = model.into();
         let profile = self
@@ -172,6 +178,21 @@ impl Router {
                 ),
             });
         }
+        // Declaration binds once and drops the adapter — resolve binds
+        // its own per call. Running the bind here is what refuses a
+        // missing or misspelled endpoint variable at startup.
+        self.client
+            .bind_provider_with(
+                route.provider.as_str(),
+                route.protocol.clone(),
+                route.region.as_deref(),
+                route.auth.clone(),
+                &bind_vars(&route.vars),
+            )
+            .map_err(|error| Error::Route {
+                model: model.clone(),
+                reason: error.to_string(),
+            })?;
         self.routes.insert(model, route);
         Ok(())
     }
@@ -234,11 +255,6 @@ impl Router {
             .routes
             .get(model)
             .ok_or_else(|| Error::UnknownModel(model.to_owned()))?;
-        let vars = route
-            .vars
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
         let adapter = self
             .client
             .bind_provider_with(
@@ -246,7 +262,7 @@ impl Router {
                 route.protocol.clone(),
                 route.region.as_deref(),
                 route.auth.clone(),
-                &vars,
+                &bind_vars(&route.vars),
             )
             .map_err(|error| Error::Route {
                 model: model.to_owned(),
@@ -258,6 +274,13 @@ impl Router {
             provider: route.provider.clone(),
         })
     }
+}
+
+/// The endpoint variables in the shape `bind_provider_with` takes.
+fn bind_vars(vars: &BTreeMap<String, String>) -> BTreeMap<&str, &str> {
+    vars.iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect()
 }
 
 /// Whether a profile's accepted mechanisms cover the mechanism the route
@@ -433,12 +456,14 @@ mod tests {
             "provider": "ollama",
             "upstreamModel": "llama3.1",
             "protocol": "other:ollama",
-            "auth": "none"
+            "auth": "none",
+            "vars": {"endpoint": "http://localhost:11434"}
         }))
         .expect("entry");
         assert_eq!(model, "chat");
         assert_eq!(route.upstream_model, "llama3.1");
         assert_eq!(route.protocol, Some(Protocol::Other("ollama".to_owned())));
+        assert_eq!(route.vars["endpoint"], "http://localhost:11434");
 
         // A missing required field or an unknown vocabulary word refuses
         // the entry — never a half-parsed route.
@@ -448,6 +473,18 @@ mod tests {
             serde_json::json!({"model": "m", "provider": "ollama", "protocol": "grpc"}),
         ] {
             assert!(Route::from_document(&entry).is_err(), "{entry}");
+        }
+
+        // `vars` fails closed the same way: a non-object or a non-string
+        // value refuses the entry — a supplied variable is never
+        // silently bound to "".
+        for entry in [
+            serde_json::json!({"model": "m", "provider": "ollama", "vars": "notanobject"}),
+            serde_json::json!({"model": "m", "provider": "ollama", "vars": {"endpoint": 42}}),
+            serde_json::json!({"model": "m", "provider": "ollama", "vars": {"endpoint": null}}),
+        ] {
+            let error = Route::from_document(&entry).expect_err("malformed vars refuse");
+            assert!(error.to_string().contains("vars"), "{entry}: {error}");
         }
     }
 }
