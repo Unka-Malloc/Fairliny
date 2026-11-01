@@ -8,4 +8,4 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 
 # The generated release-rewriter must pass the same helper tests CI runs.
-python3 .github/test_release.py
+PYTHONDONTWRITEBYTECODE=1 python3 .github/test_release.py
