@@ -564,7 +564,8 @@ fn the_routes_document_refuses_malformed_entries_and_loads_well_formed_ones() {
             }))
             .is_err()
     );
-    // A well-formed entry binds the outward name to the catalog surface.
+    // A runtime-supplied endpoint is part of the route: a local profile
+    // carries no address of its own, so a route without one cannot bind.
     router
         .load_routes(&serde_json::json!({
             "routes": [{
@@ -573,6 +574,19 @@ fn the_routes_document_refuses_malformed_entries_and_loads_well_formed_ones() {
                 "upstreamModel": "llama3.1",
                 "protocol": "other:ollama",
                 "auth": "none"
+            }]
+        }))
+        .expect("routes");
+    assert!(router.resolve("local-chat").is_err());
+    router
+        .load_routes(&serde_json::json!({
+            "routes": [{
+                "model": "local-chat",
+                "provider": "ollama",
+                "upstreamModel": "llama3.1",
+                "protocol": "other:ollama",
+                "auth": "none",
+                "vars": {"endpoint": "http://models.internal:11434"}
             }]
         }))
         .expect("routes");
@@ -634,6 +648,7 @@ fn a_route_naming_an_unknown_provider_fails_closed() {
         region: None,
         auth: a4mp::AuthKind::ApiKey,
         upstream_model: "x".to_owned(),
+        vars: Default::default(),
     };
     let error = router.add_route("model", route).expect_err("closed");
     assert!(error.to_string().contains("unknown provider"));

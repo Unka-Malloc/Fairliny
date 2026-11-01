@@ -37,6 +37,11 @@ pub struct Route {
     /// The identifier the upstream call receives. May differ from the
     /// outward name so aliases never leak deployment naming upstream.
     pub upstream_model: String,
+    /// Endpoint variables the profile's target template requires —
+    /// `{endpoint}` for runtime-supplied base URLs, `{resource}`-class
+    /// atoms for per-resource clouds. Supplied per route so no address is
+    /// ever built into the catalog.
+    pub vars: BTreeMap<String, String>,
 }
 
 impl Route {
@@ -67,6 +72,19 @@ impl Route {
             .and_then(Value::as_str)
             .unwrap_or(&model)
             .to_owned();
+        let vars = entry
+            .get("vars")
+            .map(|v| {
+                v.as_object()
+                    .map(|m| {
+                        m.iter()
+                            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_owned()))
+                            .collect()
+                    })
+                    .ok_or_else(|| invalid("vars"))
+            })
+            .transpose()?
+            .unwrap_or_default();
         Ok((
             model,
             Self {
@@ -78,6 +96,7 @@ impl Route {
                     .map(str::to_owned),
                 auth,
                 upstream_model,
+                vars,
             },
         ))
     }
@@ -215,13 +234,19 @@ impl Router {
             .routes
             .get(model)
             .ok_or_else(|| Error::UnknownModel(model.to_owned()))?;
+        let vars = route
+            .vars
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
         let adapter = self
             .client
-            .bind_provider(
+            .bind_provider_with(
                 route.provider.as_str(),
                 route.protocol.clone(),
                 route.region.as_deref(),
                 route.auth.clone(),
+                &vars,
             )
             .map_err(|error| Error::Route {
                 model: model.to_owned(),
