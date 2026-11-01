@@ -55,6 +55,33 @@ composes, it does not listen — the host owns the sockets, the custody
 channel (`FAIRLEAD_HANDOFF_FD`) and the epoch file
 (`FAIRLEAD_EPOCH_FILE`) it rewrites to revoke.
 
+The routes document is one object:
+
+```json
+{
+  "upstreamDeadlineSecs": 600,
+  "routes": [
+    {
+      "model": "chat",
+      "provider": "openai",
+      "upstreamModel": "gpt-5.2",
+      "protocol": "openai-responses",
+      "auth": "api-key"
+    }
+  ]
+}
+```
+
+- `routes[]` binds an outward `model` name to a catalog `provider`;
+  `upstreamModel` (default: `model`) is the id the upstream call
+  receives, `protocol` and `region` pin the profile's surface, and
+  `auth` (default `none`) is the mechanism the lease must answer —
+  `none`, `api-key`, `bearer`, `cloud:<service>` or `external:<client>`.
+  A malformed entry refuses startup rather than running half a table.
+- `upstreamDeadlineSecs` bounds one upstream provider call so a hung
+  provider cannot stall the gateway — default `600`, `0` restores an
+  unbounded wait for hosts that bound the call themselves.
+
 ## Skills
 
 - `skills/sdk/` — embedding guidance (lease install, routing, metering,

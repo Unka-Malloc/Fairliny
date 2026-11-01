@@ -44,3 +44,6 @@ JSON reply per stdout line.
 - A malformed route entry refuses startup rather than running half a
   route table; unknown models and unaccepted auth mechanisms fail
   closed.
+- `upstreamDeadlineSecs` in the routes document bounds one upstream
+  provider call (default `600`, `0` waits unbounded) — the knob that
+  keeps one hung provider from stalling the gateway.

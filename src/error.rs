@@ -31,6 +31,12 @@ pub enum Error {
     #[error("request: {0}")]
     Request(String),
 
+    /// The upstream call outlived the configured deadline and was
+    /// cancelled — whether the provider accepted the work is unknown, so
+    /// repeating the request is the caller's explicit decision.
+    #[error("upstream deadline exceeded after {0:?}")]
+    UpstreamDeadline(std::time::Duration),
+
     /// The bound provider adapter failed the call.
     #[error("adapter: {0}")]
     Adapter(#[from] a4mp::Error),

@@ -4,17 +4,23 @@
 //! the NDJSON sidecar: one request per stdin line, one reply per stdout
 //! line. The process composes, it does not listen — the host owns the
 //! sockets, the custody, and the epoch file it rotates to revoke.
+//!
+//! The routes document is `{"upstreamDeadlineSecs"?: 600,
+//! "routes":[{model,provider,upstreamModel?,protocol?,region?,auth?}]}` —
+//! the deadline bounds one upstream call (`0` waits unbounded), and a
+//! malformed entry refuses startup rather than running half a table.
 
 use std::path::PathBuf;
 use std::process::exit;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::Value;
 
 use fairlead::leases::{FileEpochSource, Leases};
 use fairlead::meter::Meter;
-use fairlead::router::{Route, Router};
-use fairlead::service::Service;
+use fairlead::router::Router;
+use fairlead::service::{DEFAULT_UPSTREAM_DEADLINE, Service};
 use fairlead::{Error, Result};
 
 /// The default data home when `--state-root` and `FAIRLEAD_STATE_ROOT`
@@ -45,81 +51,19 @@ fn usage() -> ! {
     exit(2)
 }
 
-/// `{"routes":[{model,provider,upstreamModel?,protocol?,region?,auth}]}`
-/// → declared routes. A malformed entry refuses startup rather than
-/// silently running half a route table.
-fn load_routes(router: &mut Router, document: &Value) -> Result<()> {
-    let empty = Vec::new();
-    let routes = document
-        .get("routes")
-        .and_then(Value::as_array)
-        .unwrap_or(&empty);
-    for entry in routes {
-        let invalid = |field: &str| Error::Request(format!("route entry requires a valid {field}"));
-        let model = entry
-            .get("model")
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid("model"))?;
-        let provider = entry
-            .get("provider")
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid("provider"))?;
-        let protocol = entry
-            .get("protocol")
-            .and_then(Value::as_str)
-            .map(parse_protocol)
-            .transpose()?;
-        let auth = parse_auth(entry.get("auth").and_then(Value::as_str).unwrap_or("none"))?;
-        let upstream_model = entry
-            .get("upstreamModel")
-            .and_then(Value::as_str)
-            .unwrap_or(model)
-            .to_owned();
-        router.add_route(
-            model,
-            Route {
-                provider: a4mp::ProviderId::new(provider),
-                protocol,
-                region: entry
-                    .get("region")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                auth,
-                upstream_model,
-            },
-        )?;
-    }
-    Ok(())
-}
-
-/// The protocol labels `models.list` reports, back to the enum.
-fn parse_protocol(label: &str) -> Result<a4mp::Protocol> {
-    match label {
-        "openai-chat-completions" => Ok(a4mp::Protocol::OpenAiChatCompletions),
-        "openai-responses" => Ok(a4mp::Protocol::OpenAiResponses),
-        "anthropic-messages" => Ok(a4mp::Protocol::AnthropicMessages),
-        "gemini-generate-content" => Ok(a4mp::Protocol::GeminiGenerateContent),
-        "bedrock-converse" => Ok(a4mp::Protocol::BedrockConverse),
-        other if other.starts_with("other:") => {
-            Ok(a4mp::Protocol::Other(other["other:".len()..].to_owned()))
+/// The upstream-deadline knob the routes document carries:
+/// `upstreamDeadlineSecs` bounds one provider call so a hung upstream
+/// cannot stall the whole gateway — `0` opts back into an unbounded
+/// wait. Absent means [`DEFAULT_UPSTREAM_DEADLINE`].
+fn upstream_deadline(config: &Value) -> Result<Option<Duration>> {
+    match config.get("upstreamDeadlineSecs") {
+        None => Ok(Some(DEFAULT_UPSTREAM_DEADLINE)),
+        Some(value) => {
+            let seconds = value.as_u64().ok_or_else(|| {
+                Error::Request("upstreamDeadlineSecs requires a non-negative integer".to_owned())
+            })?;
+            Ok((seconds > 0).then(|| Duration::from_secs(seconds)))
         }
-        _ => Err(Error::Request(format!("unknown protocol {label:?}"))),
-    }
-}
-
-/// The auth labels `models.list` reports, back to the kind.
-fn parse_auth(label: &str) -> Result<a4mp::AuthKind> {
-    match label {
-        "none" => Ok(a4mp::AuthKind::None),
-        "api-key" => Ok(a4mp::AuthKind::ApiKey),
-        "bearer" => Ok(a4mp::AuthKind::Bearer),
-        cloud if cloud.starts_with("cloud:") => Ok(a4mp::AuthKind::CloudIdentity {
-            service: cloud["cloud:".len()..].to_owned(),
-        }),
-        external if external.starts_with("external:") => Ok(a4mp::AuthKind::External {
-            client: external["external:".len()..].to_owned(),
-        }),
-        _ => Err(Error::Request(format!("unknown auth {label:?}"))),
     }
 }
 
@@ -194,18 +138,22 @@ async fn serve(args: &[String]) -> Result<()> {
     install_handoff_if_offered(&leases)?;
     let transport = Arc::new(a4mp::ReqwestTransport::new());
     let mut router = Router::new(transport, Arc::new(leases));
-    load_routes(&mut router, &config)?;
+    router.load_routes(&config)?;
+    let deadline = upstream_deadline(&config)?;
 
     let meter = if args.iter().any(|arg| arg == "--no-meter") {
         Meter::unmetered()
     } else {
         Meter::open(&state_root)?
     };
-    let service = Service::new(router, meter);
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
+    let service = Service::new(router, meter).with_upstream_deadline(deadline);
+    // Tokio's stdin reads through its blocking pool, so an idle sidecar
+    // still yields the runtime to the settlement tasks replies spawned.
     service
-        .serve(std::io::BufReader::new(stdin.lock()), stdout.lock())
+        .serve(
+            tokio::io::BufReader::new(tokio::io::stdin()),
+            tokio::io::stdout(),
+        )
         .await
         .map_err(|error| Error::Request(format!("serve loop: {error}")))?;
     // Drain settlements so a settled request is never lost to process exit.
