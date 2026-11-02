@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Required verification entry for Fairlead.
+# Required verification entry for Fairliny.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

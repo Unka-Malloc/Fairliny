@@ -1,4 +1,4 @@
-# Fairlead
+# Fairliny
 
 The unified model gateway. It gathers model-provider access (a4mp) and
 credential leases (Credential-Lease) into one outward model-service face;
@@ -13,7 +13,7 @@ hook — never inside it.
 ## Boundary
 
 - **Custody, persistence and owner authorization belong to the host.**
-  Fairlead consumes `CredentialHandoff` documents over a process-local
+  Fairliny consumes `CredentialHandoff` documents over a process-local
   channel (an inherited file descriptor is the designed-for carrier) and
   rebuilds process-bound `CredentialLease`s; it never stores keys, and
   secret bytes never appear in serialized output, debug projections,
@@ -25,9 +25,9 @@ hook — never inside it.
   response-settlement observations run asynchronously beside the
   forwarded request; a metering failure is counted in-process and never
   propagated into a response.
-- **The host owns the listeners.** `fairlead serve` is an NDJSON sidecar
+- **The host owns the listeners.** `fairliny serve` is an NDJSON sidecar
   on stdio; `metrics.exposition` returns text for a host-mounted
-  `/metrics` route — Fairlead never opens a socket for metrics.
+  `/metrics` route — Fairliny never opens a socket for metrics.
 
 ## Modules
 
@@ -37,25 +37,25 @@ hook — never inside it.
 | `leases` | The credential custody port: the `ProviderCredential` kind family, the process-bound `CredentialSlot`, `FileEpochSource` for custody-driven revocation, and a4mp's `CredentialResolver`. |
 | `meter` | Metera composed in: bounded per-day agent×model request counters (`GatewayUsageRecorder`-shaped), and response settlement — `ProviderMapping` → `SourceBinding` → `UsageSourcePort` — into the usage journal. |
 | `export` | Prometheus/OpenMetrics text from `agent-statistics::export` for a host-mounted scrape route. |
-| `service` | The `fairlead serve` sidecar: one JSON request per stdin line, methods `models.list`, `chat.complete`, `metrics.exposition`. |
+| `service` | The `fairliny serve` sidecar: one JSON request per stdin line, methods `models.list`, `chat.complete`, `metrics.exposition`. |
 
-## `fairlead serve`
+## `fairliny serve`
 
 ```
-fairlead serve [--config routes.json] [--state-root DIR]
+fairliny serve [--config routes.json] [--state-root DIR]
 ```
 
 Requests are one JSON object per line: `{"id":N,"method":...,"params":{}}`.
 Replies are `{"id":N,"result":{...}}` or `{"id":N,"error":"..."}`; a
 malformed line answers `id: null` and the loop continues.
 
-- `--config` / `FAIRLEAD_CONFIG` — routes document:
+- `--config` / `FAIRLINY_CONFIG` — routes document:
   `{"routes":[{"model":"chat","provider":"openai","upstreamModel":"gpt-4o-mini","protocol":"openai-chat-completions","auth":"api-key"}]}`
-- `--state-root` / `FAIRLEAD_STATE_ROOT` — the metering data home
-  (default `~/.fairlead`); `--no-meter` keeps counters in memory and
+- `--state-root` / `FAIRLINY_STATE_ROOT` — the metering data home
+  (default `~/.fairliny`); `--no-meter` keeps counters in memory and
   skips the journal.
-- `FAIRLEAD_HANDOFF_FD` — an inherited file descriptor carrying the
-  `CredentialHandoff` document (unix). `FAIRLEAD_EPOCH_FILE` names the
+- `FAIRLINY_HANDOFF_FD` — an inherited file descriptor carrying the
+  `CredentialHandoff` document (unix). `FAIRLINY_EPOCH_FILE` names the
   file the custody owner rewrites on epoch rotation; without it the
   lease runs against its own minted epoch — resolution works, revocation
   has no channel.

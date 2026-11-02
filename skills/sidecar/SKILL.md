@@ -1,11 +1,11 @@
 ---
-name: fairlead-sidecar
-description: Drive the fairlead gateway from any language — `fairlead serve` is an NDJSON stdio sidecar exposing models.list, chat.complete and metrics.exposition.
+name: fairliny-sidecar
+description: Drive the fairliny gateway from any language — `fairliny serve` is an NDJSON stdio sidecar exposing models.list, chat.complete and metrics.exposition.
 ---
 
-# fairlead Sidecar mode
+# fairliny Sidecar mode
 
-Spawn `fairlead serve`, write one JSON request per stdin line, read one
+Spawn `fairliny serve`, write one JSON request per stdin line, read one
 JSON reply per stdout line.
 
 ## When to use
@@ -33,12 +33,12 @@ JSON reply per stdout line.
 ## Rules that keep the contract
 
 - Configuration lands by launch flags or environment: `--config` /
-  `FAIRLEAD_CONFIG` for the routes document, `--state-root` /
-  `FAIRLEAD_STATE_ROOT` for the metering data home (default
-  `~/.fairlead`), `--no-meter` for in-memory counters with no journal.
-- Credentials arrive through `FAIRLEAD_HANDOFF_FD` — an inherited file
+  `FAIRLINY_CONFIG` for the routes document, `--state-root` /
+  `FAIRLINY_STATE_ROOT` for the metering data home (default
+  `~/.fairliny`), `--no-meter` for in-memory counters with no journal.
+- Credentials arrive through `FAIRLINY_HANDOFF_FD` — an inherited file
   descriptor carrying the `CredentialHandoff` document.
-  `FAIRLEAD_EPOCH_FILE` names the file the custody owner rewrites on
+  `FAIRLINY_EPOCH_FILE` names the file the custody owner rewrites on
   epoch rotation; without it the lease resolves but revocation has no
   channel.
 - A malformed route entry refuses startup rather than running half a

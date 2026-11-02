@@ -1,6 +1,6 @@
-//! Fairlead — the unified model gateway.
+//! Fairliny — the unified model gateway.
 //!
-//! Fairlead gathers model-provider access (a4mp adapters) and credential
+//! Fairliny gathers model-provider access (a4mp adapters) and credential
 //! leases (Credential-Lease) into one outward model-service face. The core
 //! is forwarding-only: a caller names a model, [`router`] binds the
 //! configured provider profile to a live a4mp adapter, [`leases`] answers
@@ -12,7 +12,7 @@
 //! Boundaries are structural:
 //!
 //! - **Custody, persistence and owner authorization belong to the host.**
-//!   Fairlead consumes `CredentialHandoff` documents over a process-local
+//!   Fairliny consumes `CredentialHandoff` documents over a process-local
 //!   channel and rebuilds process-bound `CredentialLease`s; it never
 //!   stores keys, and secret bytes never appear in serialized output,
 //!   debug projections, logs or errors.
@@ -23,9 +23,9 @@
 //! - **Metering is fault-isolated.** Both hooks run beside the forwarded
 //!   request; a metering failure is counted in-process and never
 //!   propagated into a response.
-//! - **The host owns the listeners.** `fairlead serve` is an NDJSON
+//! - **The host owns the listeners.** `fairliny serve` is an NDJSON
 //!   sidecar on stdio; [`export`] returns exposition text for a
-//!   host-mounted `/metrics` route — Fairlead never opens a socket.
+//!   host-mounted `/metrics` route — Fairliny never opens a socket.
 
 pub mod error;
 pub mod export;

@@ -1,4 +1,4 @@
-//! The outward face: the `fairlead serve` NDJSON loop and dispatch.
+//! The outward face: the `fairliny serve` NDJSON loop and dispatch.
 //!
 //! One JSON request per line — `{"id":N,"method":...,"params":{}}` in,
 //! `{"id":N,"result":{...}}` or `{"id":N,"error":"..."}` out. A malformed,

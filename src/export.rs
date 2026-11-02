@@ -1,6 +1,6 @@
 //! Metrics exposition for a host-mounted scrape route.
 //!
-//! Fairlead returns text; the host owns the listener. The projection is
+//! Fairliny returns text; the host owns the listener. The projection is
 //! `agent-statistics`' own: the same journal the gateway settles into is
 //! the journal a scrape summarizes, and the retained request counters
 //! arrive as the gateway document the exposition already understands.
