@@ -1,7 +1,7 @@
 //! The credential custody port: leases in, a4mp `CredentialResolver` out.
 //!
 //! Custody — the system keyring, persistence, owner authorization — belongs
-//! to the host. Fairlead accepts a `CredentialHandoff` over a process-local
+//! to the host. Fairliny accepts a `CredentialHandoff` over a process-local
 //! channel (an inherited file descriptor is the designed-for carrier),
 //! keeps it in a process-bound [`CredentialSlot`], and answers a4mp's
 //! `CredentialResolver` from it: every resolution consults the custody
@@ -44,7 +44,7 @@ pub enum ProviderCredential {
 impl CredentialKind for ProviderCredential {
     /// The schema every provider-credential handoff pins: documents minted
     /// for another family can never parse as this one.
-    const HANDOFF_SCHEMA: &'static str = "fairlead.provider-credentials.handoff.v1";
+    const HANDOFF_SCHEMA: &'static str = "fairliny.provider-credentials.handoff.v1";
 
     fn as_str(self) -> &'static str {
         match self {

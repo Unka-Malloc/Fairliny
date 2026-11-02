@@ -1,11 +1,11 @@
 ---
-name: fairlead-sdk
-description: Embed the fairlead gateway in a Rust host — credential leases in over a process-local handoff, a4mp routing, and fault-isolated Metera metering.
+name: fairliny-sdk
+description: Embed the fairliny gateway in a Rust host — credential leases in over a process-local handoff, a4mp routing, and fault-isolated Metera metering.
 ---
 
-# fairlead SDK mode
+# fairliny SDK mode
 
-Embed `fairlead` and compose the outward model-service face in-process.
+Embed `fairliny` and compose the outward model-service face in-process.
 
 ## When to use
 
@@ -27,13 +27,13 @@ router.add_route("chat", route)?;                       // or register_adapter /
 let meter = Meter::open(state_root)?;                   // compose(root, binding) | unmetered()
 let service = Service::new(router, meter);
 let reply = service.dispatch(id, Some("chat.complete"), &params).await;
-let exposition = fairlead::export::render(service.meter())?;
+let exposition = fairliny_gateway::export::render(service.meter())?;
 ```
 
 ## Rules that keep the contract
 
 - Custody, persistence and owner authorization stay in the host. The
-  handoff document arrives over a process-local channel; Fairlead never
+  handoff document arrives over a process-local channel; Fairliny never
   stores keys, and secret bytes never appear in serialized output,
   debug projections, logs or errors.
 - Unknown usage stays unknown: a counter the provider did not report is
@@ -42,5 +42,5 @@ let exposition = fairlead::export::render(service.meter())?;
 - Metering is fault-isolated: `admit_request` and `settle_response` run
   beside the forwarded request; a metering failure is counted in-process
   (`failure_count`), never propagated into a response.
-- Fairlead never opens a socket: the host owns the listeners and mounts
+- Fairliny never opens a socket: the host owns the listeners and mounts
   `export::render` output where it wants it.

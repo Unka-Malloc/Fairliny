@@ -1,6 +1,6 @@
-//! fairlead — the unified model gateway.
+//! fairliny — the unified model gateway.
 //!
-//! `fairlead serve [--config FILE] [--state-root DIR] [--no-meter]` runs
+//! `fairliny serve [--config FILE] [--state-root DIR] [--no-meter]` runs
 //! the NDJSON sidecar: one request per stdin line, one reply per stdout
 //! line. The process composes, it does not listen — the host owns the
 //! sockets, the custody, and the epoch file it rotates to revoke.
@@ -17,19 +17,19 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use fairlead::leases::{FileEpochSource, Leases};
-use fairlead::meter::Meter;
-use fairlead::router::Router;
-use fairlead::service::{DEFAULT_UPSTREAM_DEADLINE, Service};
-use fairlead::{Error, Result};
+use fairliny_gateway::leases::{FileEpochSource, Leases};
+use fairliny_gateway::meter::Meter;
+use fairliny_gateway::router::Router;
+use fairliny_gateway::service::{DEFAULT_UPSTREAM_DEADLINE, Service};
+use fairliny_gateway::{Error, Result};
 
-/// The default data home when `--state-root` and `FAIRLEAD_STATE_ROOT`
+/// The default data home when `--state-root` and `FAIRLINY_STATE_ROOT`
 /// both stay silent.
 fn default_state_root() -> PathBuf {
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
-        .map(|home| PathBuf::from(home).join(".fairlead"))
-        .unwrap_or_else(|_| PathBuf::from(".fairlead"))
+        .map(|home| PathBuf::from(home).join(".fairliny"))
+        .unwrap_or_else(|_| PathBuf::from(".fairliny"))
 }
 
 fn flag_value(args: &[String], name: &str) -> Option<String> {
@@ -41,12 +41,12 @@ fn flag_value(args: &[String], name: &str) -> Option<String> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  fairlead serve [--config FILE] [--state-root DIR] [--no-meter]\n\n\
+        "usage:\n  fairliny serve [--config FILE] [--state-root DIR] [--no-meter]\n\n\
          environment:\n  \
-         FAIRLEAD_CONFIG       routes document (same shape as --config)\n  \
-         FAIRLEAD_STATE_ROOT   metering data home (default ~/.fairlead)\n  \
-         FAIRLEAD_HANDOFF_FD   inherited fd carrying the CredentialHandoff document\n  \
-         FAIRLEAD_EPOCH_FILE   file the custody owner rewrites to rotate the lease epoch"
+         FAIRLINY_CONFIG       routes document (same shape as --config)\n  \
+         FAIRLINY_STATE_ROOT   metering data home (default ~/.fairliny)\n  \
+         FAIRLINY_HANDOFF_FD   inherited fd carrying the CredentialHandoff document\n  \
+         FAIRLINY_EPOCH_FILE   file the custody owner rewrites to rotate the lease epoch"
     );
     exit(2)
 }
@@ -75,7 +75,7 @@ fn upstream_deadline(config: &Value) -> Result<Option<Duration>> {
 #[cfg(unix)]
 fn read_handoff_fd(fd: std::os::fd::RawFd) -> Result<zeroize::Zeroizing<Vec<u8>>> {
     use std::os::fd::BorrowedFd;
-    // SAFETY: the host contract behind FAIRLEAD_HANDOFF_FD guarantees an
+    // SAFETY: the host contract behind FAIRLINY_HANDOFF_FD guarantees an
     // open descriptor; borrowing it does not take ownership.
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
     let channel = std::fs::File::from(
@@ -89,11 +89,11 @@ fn read_handoff_fd(fd: std::os::fd::RawFd) -> Result<zeroize::Zeroizing<Vec<u8>>
 /// Read and install the handoff the host left on the inherited fd.
 ///
 /// The channel and the epoch source are the two custody answers the
-/// runtime needs: `FAIRLEAD_EPOCH_FILE` gives revocation a way to arrive;
+/// runtime needs: `FAIRLINY_EPOCH_FILE` gives revocation a way to arrive;
 /// without it the lease runs against its own minted epoch — functional,
 /// but revocation has no channel.
 fn install_handoff_if_offered(leases: &Leases) -> Result<()> {
-    let Some(fd) = std::env::var("FAIRLEAD_HANDOFF_FD")
+    let Some(fd) = std::env::var("FAIRLINY_HANDOFF_FD")
         .ok()
         .and_then(|value| value.parse::<i32>().ok())
     else {
@@ -102,7 +102,7 @@ fn install_handoff_if_offered(leases: &Leases) -> Result<()> {
     #[cfg(unix)]
     {
         let document = read_handoff_fd(fd)?;
-        match std::env::var("FAIRLEAD_EPOCH_FILE") {
+        match std::env::var("FAIRLINY_EPOCH_FILE") {
             Ok(path) => leases.install_handoff(&document, Arc::new(FileEpochSource::new(path))),
             Err(_) => leases.install_handoff_self_epoch(&document),
         }
@@ -118,11 +118,11 @@ fn install_handoff_if_offered(leases: &Leases) -> Result<()> {
 
 async fn serve(args: &[String]) -> Result<()> {
     let state_root = flag_value(args, "--state-root")
-        .or_else(|| std::env::var("FAIRLEAD_STATE_ROOT").ok())
+        .or_else(|| std::env::var("FAIRLINY_STATE_ROOT").ok())
         .map(PathBuf::from)
         .unwrap_or_else(default_state_root);
     let config_text = flag_value(args, "--config")
-        .or_else(|| std::env::var("FAIRLEAD_CONFIG").ok())
+        .or_else(|| std::env::var("FAIRLINY_CONFIG").ok())
         .map(|path| {
             std::fs::read_to_string(&path)
                 .map_err(|error| Error::Request(format!("config {path}: {error}")))
@@ -177,7 +177,7 @@ async fn main() {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use fairlead::leases::ProviderCredential;
+    use fairliny_gateway::leases::ProviderCredential;
     use std::collections::BTreeMap;
     use std::os::fd::{AsRawFd, BorrowedFd};
     use std::time::Duration;

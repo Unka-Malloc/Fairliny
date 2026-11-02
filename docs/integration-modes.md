@@ -1,8 +1,8 @@
 # Integration modes
 
 Two ways to consume the gateway, one semantics. A Rust host embeds the
-`fairlead` crate and composes the router, the lease port and the meter
-itself; a host in any other language spawns `fairlead serve` and speaks
+`fairliny` crate and composes the router, the lease port and the meter
+itself; a host in any other language spawns `fairliny serve` and speaks
 one JSON object per line over stdio — both paths land on the same
 `Service::dispatch`.
 
@@ -10,12 +10,12 @@ one JSON object per line over stdio — both paths land on the same
 
 ```toml
 [dependencies]
-fairlead = "0.1"
+fairliny = "0.1"
 ```
 
 ```rust
 use std::sync::Arc;
-use fairlead::{
+use fairliny_gateway::{
     leases::{FileEpochSource, Leases},
     meter::Meter,
     router::Router,
@@ -41,10 +41,10 @@ the admission counters and response settlement, `export` renders the
 Prometheus/OpenMetrics text a host mounts at its own `/metrics` route.
 `Service::new` is only the assembly of those three.
 
-## Sidecar — `fairlead serve`
+## Sidecar — `fairliny serve`
 
 ```sh
-fairlead serve [--config routes.json] [--state-root DIR] [--no-meter]
+fairliny serve [--config routes.json] [--state-root DIR] [--no-meter]
 ```
 
 One `{"id":N,"method":...,"params":{}}` per stdin line, one
@@ -52,8 +52,8 @@ One `{"id":N,"method":...,"params":{}}` per stdin line, one
 non-UTF-8 line answers `id: null` and the loop continues. Methods:
 `models.list`, `chat.complete`, `metrics.exposition`. The process
 composes, it does not listen — the host owns the sockets, the custody
-channel (`FAIRLEAD_HANDOFF_FD`) and the epoch file
-(`FAIRLEAD_EPOCH_FILE`) it rewrites to revoke.
+channel (`FAIRLINY_HANDOFF_FD`) and the epoch file
+(`FAIRLINY_EPOCH_FILE`) it rewrites to revoke.
 
 The routes document is one object:
 

@@ -1,21 +1,21 @@
 [package]
-name = "fairlead"
+name = "fairliny-gateway"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95.0"
 license = "AGPL-3.0-or-later"
-repository = "https://github.com/Unka-Malloc/Fairlead"
+repository = "https://github.com/Unka-Malloc/Fairliny-Gateway"
 description = "The unified model gateway: gathers model-provider access (a4mp) and credential leases (Credential-Lease) into one outward model-service face; a forwarding-only core with Metera usage metering composed in."
 keywords = ["ai", "llm", "gateway", "model-provider", "metering"]
 categories = ["api-bindings", "asynchronous", "web-programming"]
 
 [lib]
-name = "fairlead"
+name = "fairliny_gateway"
 path = "src/lib.rs"
 
 [[bin]]
-name = "fairlead"
-path = "src/bin/fairlead.rs"
+name = "fairliny"
+path = "src/bin/fairliny.rs"
 
 [workspace]
 resolver = "3"

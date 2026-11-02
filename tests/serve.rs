@@ -7,10 +7,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use credential_lease::{CredentialHandoff, LeaseEpochSource, LeasedCredential, SecretBytes};
-use fairlead::leases::{Leases, ProviderCredential};
-use fairlead::meter::Meter;
-use fairlead::router::{Route, Router};
-use fairlead::service::Service;
+use fairliny_gateway::leases::{Leases, ProviderCredential};
+use fairliny_gateway::meter::Meter;
+use fairliny_gateway::router::{Route, Router};
+use fairliny_gateway::service::Service;
 
 /// An epoch source a test can rotate — the contract the custody owner
 /// holds on the host side. `None` is a legal answer; tests keep an epoch
@@ -201,7 +201,7 @@ async fn the_loop_answers_and_settles_one_forwarded_request() {
     assert_eq!(requests.lock().unwrap()[0].model, "upstream-ping");
 
     // Admission landed and settlement pushed bound facts into the journal.
-    let exposition = fairlead::export::render(service.meter()).expect("render");
+    let exposition = fairliny_gateway::export::render(service.meter()).expect("render");
     assert!(exposition.contains("metera_gateway_agent_requests_total"));
     assert!(exposition.contains("metera_usage_tokens{kind=\"input\""));
     let facts = service.meter().facts();
@@ -249,7 +249,7 @@ async fn oversized_and_non_utf8_lines_error_without_killing_the_loop() {
     let mut input = Vec::new();
     // A hostile line past the byte cap — never fully buffered, answered
     // `id: null`, remainder discarded to the next newline.
-    input.resize(fairlead::service::MAX_LINE_BYTES + 64, b'x');
+    input.resize(fairliny_gateway::service::MAX_LINE_BYTES + 64, b'x');
     input.push(b'\n');
     input.extend_from_slice(b"{\"id\":1,\"method\":\"models.list\"}\n");
     // Non-UTF-8 input is a malformed line, not a loop-killing read error.
@@ -525,7 +525,7 @@ fn a_rewritten_epoch_file_revokes_the_next_resolve() {
     leases
         .install_handoff(
             &handoff_bytes(&epoch),
-            Arc::new(fairlead::leases::FileEpochSource::new(&path)),
+            Arc::new(fairliny_gateway::leases::FileEpochSource::new(&path)),
         )
         .expect("install");
     // While the file agrees, the lease resolves.
@@ -618,13 +618,13 @@ fn the_binary_serves_ndjson_over_stdio() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = dir.path().join("routes.json");
     std::fs::write(&config, r#"{"routes":[]}"#).expect("config");
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_fairlead"))
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_fairliny"))
         .args(["serve", "--no-meter", "--config"])
         .arg(&config)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
-        .expect("spawn fairlead");
+        .expect("spawn fairliny");
     {
         use std::io::Write;
         let mut stdin = child.stdin.take().expect("stdin");
