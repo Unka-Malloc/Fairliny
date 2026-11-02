@@ -23,8 +23,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agent_statistics::gateway::UsageDocument;
@@ -49,10 +49,10 @@ use crate::{Error, Result};
 const FORWARDED_SCOPE: &str = "gateway:forwarded";
 
 /// The host-issued source identity the gateway settles under.
-const SOURCE_REF: &str = "source:fairlead.gateway#1";
+const SOURCE_REF: &str = "source:fairliny.gateway#1";
 
 /// The extension id the binding declares — this gateway is the source.
-const EXTENSION_ID: &str = "fairlead.gateway";
+const EXTENSION_ID: &str = "fairliny.gateway";
 
 /// Bounds mirror the recorder's own: same retention, same folding, so the
 /// exposition contract holds unchanged.
@@ -235,7 +235,7 @@ fn label(text: &str) -> String {
 /// hook, both fault-isolated from the forward path.
 pub struct Meter {
     admissions: Mutex<Admissions>,
-    journal: Option<Mutex<UsageSourceHost>>,
+    journal: Option<Arc<Mutex<UsageSourceHost>>>,
     admission: Option<SourceAdmission>,
     sequence: AtomicU64,
     failures: AtomicU64,
@@ -263,20 +263,41 @@ impl Meter {
     /// owns the source identity (instance, generation, epoch, grants).
     pub fn compose(state_root: impl AsRef<Path>, binding: SourceBinding) -> Result<Self> {
         let root = state_root.as_ref();
-        let admissions = Admissions::open(root.join(COUNTERS_FILE))?;
         let host = UsageSourceHost::open(&json!({"stateRoot": root.to_string_lossy()}))
             .map_err(|error| Error::Meter(error.to_string()))?;
-        let admission = host.admit_source(binding, SettlementEligibility::SettlementEligible);
+        Self::shared(root, Arc::new(Mutex::new(host)), binding)
+    }
+
+    /// Compose over a journal the composition root already owns — the
+    /// single-instance shape. One `UsageSourceHost` engine serves every
+    /// metering face in the process (the gateway here, agent-side
+    /// collection beside it), so the `agent-usage` ledger has exactly
+    /// one writer even when the host embeds Metera itself. The binding
+    /// still names the gateway's own source identity; admission lands
+    /// on the shared host. The counters document remains the gateway's
+    /// own file under `state_root`.
+    pub fn shared(
+        state_root: impl AsRef<Path>,
+        host: Arc<Mutex<UsageSourceHost>>,
+        binding: SourceBinding,
+    ) -> Result<Self> {
+        let admissions = Admissions::open(state_root.as_ref().join(COUNTERS_FILE))?;
+        let admission = {
+            let host = host
+                .lock()
+                .map_err(|_| Error::Meter("journal lock poisoned".to_owned()))?;
+            host.admit_source(binding, SettlementEligibility::SettlementEligible)
+        };
         Ok(Self {
             admissions: Mutex::new(admissions),
-            journal: Some(Mutex::new(host)),
+            journal: Some(host),
             admission: Some(admission),
             sequence: AtomicU64::new(0),
             failures: AtomicU64::new(0),
         })
     }
 
-    /// Counters without a journal — the shape a host uses when Fairlead
+    /// Counters without a journal — the shape a host uses when Fairliny
     /// runs with no metering state root. Admission still counts and
     /// exports; settlement has nowhere to go and declines quietly.
     pub fn unmetered() -> Self {
@@ -579,7 +600,7 @@ mod tests {
     #[test]
     fn counters_fold_and_persist_like_the_recorder() {
         let root =
-            std::env::temp_dir().join(format!("fairlead-admissions-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("fairliny-admissions-{}", uuid::Uuid::new_v4()));
         collection_store::fs::ensure_private_dir(&root).unwrap();
         let path = root.join(COUNTERS_FILE);
         {
@@ -605,7 +626,7 @@ mod tests {
     #[test]
     fn persistence_coalesces_instead_of_rewriting_per_request() {
         let root =
-            std::env::temp_dir().join(format!("fairlead-admissions-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("fairliny-admissions-{}", uuid::Uuid::new_v4()));
         collection_store::fs::ensure_private_dir(&root).unwrap();
         let path = root.join(COUNTERS_FILE);
         let mut admissions = Admissions::open(path.clone()).unwrap();
@@ -685,7 +706,7 @@ mod tests {
 
     #[tokio::test]
     async fn named_but_uncounted_fields_settle_as_unknown_never_absent() {
-        let root = std::env::temp_dir().join(format!("fairlead-settle-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("fairliny-settle-{}", uuid::Uuid::new_v4()));
         collection_store::fs::ensure_private_dir(&root).unwrap();
         let binding = SourceBinding::new(
             "source:test#1",
