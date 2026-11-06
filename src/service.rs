@@ -8,23 +8,33 @@
 //! - `models.list` — the bound route table. Configured surfaces, never a
 //!   live-availability claim: a profile's presence asserts a supported
 //!   access surface, not that the provider is reachable now.
-//! - `chat.complete` — forward one chat request through the bound adapter;
-//!   admission counts at accept, settlement follows the response on its
-//!   own task.
+//! - `chat.complete` — forward one `{dialect, body, agent?}` chat request
+//!   through the wire codecs and the bound adapter; the result is
+//!   `{body, losses}` — the dialect response plus every conversion loss.
+//! - `chat.stream` — the same params; the replies are `stream:"data"`
+//!   frame lines then exactly one `stream:"end"` line. Frames and other
+//!   requests' replies may interleave — correlate by `id`.
+//! - `chat.cancel` — `{"requestId"}` cancels that in-flight request's
+//!   control token.
 //! - `metrics.exposition` — the Prometheus/OpenMetrics text a host mounts
 //!   at `/metrics`.
 //!
 //! Nothing here touches credential material: the router hands the adapter
 //! a resolver, the lease answers, and only refusal codes travel back.
+//! `upstreamDeadlineSecs` is the host's opt-in bound on one upstream call;
+//! absent or `0` waits unbounded — viable work runs to completion and only
+//! the caller cancels.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures_core::Stream;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinSet;
 
-use crate::meter::{Meter, UsageKeyStyle, usage_object};
+use crate::meter::Meter;
 use crate::router::{BoundRoute, Router, auth_label, protocol_label};
 use crate::{Error, Result};
 
@@ -32,13 +42,6 @@ use crate::{Error, Result};
 /// a request: answered `id: null`, its remainder discarded through the
 /// next newline without ever being buffered.
 pub const MAX_LINE_BYTES: usize = 1024 * 1024;
-
-/// The default deadline on one upstream call. Provider hangs are
-/// indistinguishable from very slow answers at the transport layer, so
-/// the bound is generous — six hundred seconds is far past a healthy
-/// buffered completion — and `upstreamDeadlineSecs` overrides it in the
-/// routes document; `0` means the host accepts an unbounded wait.
-pub const DEFAULT_UPSTREAM_DEADLINE: Duration = Duration::from_secs(600);
 
 /// What one [`read_capped_line`] call produced.
 enum InputLine {
@@ -99,12 +102,17 @@ async fn read_capped_line(
 pub struct Service {
     router: Router,
     meter: Arc<Meter>,
-    /// The deadline one upstream call gets, or `None` for an unbounded
-    /// wait — see [`DEFAULT_UPSTREAM_DEADLINE`].
+    /// The deadline one upstream call gets when the host opted in through
+    /// the routes document, or `None` for an unbounded wait — the caller
+    /// cancels; the sidecar never cuts viable work off on its own timer.
     upstream_deadline: Option<Duration>,
-    /// Settlement tasks spawned beside replies — reaped as they finish
-    /// so the set holds live work, never one retained task per request.
-    settle: Mutex<JoinSet<()>>,
+    /// Settlement tasks — the same fault-isolated set as before, shared
+    /// with the forward tasks that spawn into it.
+    settle: Arc<Mutex<JoinSet<()>>>,
+    /// In-flight request id → its control handle, for `chat.cancel`.
+    inflight: Arc<Mutex<BTreeMap<String, a4mp::RequestControl>>>,
+    /// Spawned chat tasks, reaped like the settlement set.
+    forward: Mutex<JoinSet<()>>,
 }
 
 impl Service {
@@ -113,16 +121,18 @@ impl Service {
         Self {
             router,
             meter: Arc::new(meter),
-            upstream_deadline: Some(DEFAULT_UPSTREAM_DEADLINE),
-            settle: Mutex::new(JoinSet::new()),
+            upstream_deadline: None,
+            settle: Arc::new(Mutex::new(JoinSet::new())),
+            inflight: Arc::new(Mutex::new(BTreeMap::new())),
+            forward: Mutex::new(JoinSet::new()),
         }
     }
 
-    /// Set the deadline one upstream call gets: the forwarded request
-    /// errors with `upstream_deadline` once the provider call outlives
-    /// it, so one hung provider cannot stall the whole gateway. `None`
-    /// restores the caller-cancels model for hosts that bound the call
-    /// themselves.
+    /// Set the deadline one upstream call gets: a bound the host chose,
+    /// not a default — the forwarded request errors with
+    /// `upstream_deadline` once the provider call outlives it, so one
+    /// hung provider cannot stall the whole gateway. `None` is the
+    /// caller-cancels model for hosts that bound the call themselves.
     pub fn with_upstream_deadline(mut self, deadline: Option<Duration>) -> Self {
         self.upstream_deadline = deadline;
         self
@@ -159,6 +169,90 @@ impl Service {
         }
     }
 
+    /// Reap forward tasks that already finished — the same bound
+    /// `reap_settlements` keeps on the settlement set.
+    fn reap_forward(&self) {
+        if let Ok(mut tasks) = self.forward.lock() {
+            while tasks.try_join_next().is_some() {}
+        }
+    }
+
+    /// Claim a request id for the life of one forward. A duplicate id is
+    /// refused: two requests cannot share one correlation key.
+    fn register(&self, key: &str, control: &a4mp::RequestControl) -> bool {
+        match self.inflight.lock() {
+            Ok(mut table) if !table.contains_key(key) => {
+                table.insert(key.to_owned(), control.clone());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Parse `{dialect, body, agent?}` into the canonical request, resolve
+    /// the outward model through the route table, rewrite the model to the
+    /// upstream id, and count the admission — all before the task spawns,
+    /// so a refused request never enters the in-flight table.
+    fn prepare_chat(&self, params: &Value) -> Result<PreparedChat> {
+        let dialect = match params.get("dialect").and_then(Value::as_str) {
+            Some("openai-chat-completions") => a4mp::wire::WireDialect::OpenAiChatCompletions,
+            Some("openai-responses") => a4mp::wire::WireDialect::OpenAiResponses,
+            Some("anthropic-messages") => a4mp::wire::WireDialect::AnthropicMessages,
+            _ => {
+                return Err(Error::Request(
+                    "chat params require a supported dialect: openai-chat-completions, \
+                     openai-responses or anthropic-messages"
+                        .to_owned(),
+                ));
+            }
+        };
+        let body = params.get("body").ok_or_else(|| {
+            Error::Request("chat params require a dialect request body".to_owned())
+        })?;
+        let bytes =
+            serde_json::to_vec(body).map_err(|e| Error::Request(format!("request body: {e}")))?;
+        let (mut request, report) = a4mp::wire::decode_chat_request(dialect, &bytes)
+            .map_err(|e| Error::Request(format!("request: {e}")))?;
+        let client_model = request.model.clone();
+        let bound = self.router.resolve(&client_model)?;
+        request.model = bound.upstream_model.clone();
+        let agent = params
+            .get("agent")
+            .and_then(Value::as_str)
+            .unwrap_or("stdio")
+            .to_owned();
+        self.meter.admit_request(&agent, &client_model);
+        Ok(PreparedChat {
+            bound,
+            request,
+            client_model,
+            dialect,
+            losses: report.losses,
+            control: a4mp::RequestControl::default(),
+        })
+    }
+
+    /// `chat.cancel` looks the named request up in the in-flight table
+    /// and cancels its control token — the adapter surfaces the
+    /// cancellation, whatever it was doing.
+    fn chat_cancel(&self, params: &Value) -> Result<Value> {
+        let target = params
+            .get("requestId")
+            .ok_or_else(|| Error::Request("chat.cancel params require requestId".to_owned()))?;
+        let key = id_key(target);
+        let control = match self.inflight.lock() {
+            Ok(mut table) => table.remove(&key),
+            Err(_) => return Err(Error::Request("in-flight table poisoned".to_owned())),
+        };
+        match control {
+            Some(control) => {
+                control.cancel.cancel();
+                Ok(json!({ "cancelled": true }))
+            }
+            None => Err(Error::Request("unknown in-flight request".to_owned())),
+        }
+    }
+
     /// One request, one reply. The reply never depends on the settlement
     /// that follows it — dispatch is the per-request unit of work.
     pub async fn dispatch(&self, id: Value, method: Option<&str>, params: &Value) -> Value {
@@ -167,33 +261,60 @@ impl Service {
         self.reap_settlements();
         match method {
             Some("models.list") => reply(id, self.models_list()),
-            Some("chat.complete") => reply(id, self.chat_complete(params).await),
+            Some("chat.complete") => self.dispatch_buffered(id, params).await,
+            // The cancel contract names its refusal verbatim — the
+            // variant's own message crosses the wire, not the
+            // `request:`-prefixed Display.
+            Some("chat.cancel") => match self.chat_cancel(params) {
+                Ok(value) => reply(id, Ok(value)),
+                Err(Error::Request(message)) => error_reply(id, &message),
+                Err(error) => error_reply(id, &error.to_string()),
+            },
+            Some("chat.stream") => error_reply(id, "chat.stream requires the serve loop"),
             Some("metrics.exposition") => reply(id, self.metrics_exposition().await),
             _ => error_reply(id, "unknown method"),
         }
     }
 
-    /// The stdin loop: parse a line, dispatch it, write the reply, and
-    /// continue. Returns on EOF or a stream error; a malformed, oversized
-    /// or non-UTF-8 line is a per-request `id: null` error, never a fatal
-    /// one, and the loop is ready for the next line.
-    ///
-    /// Input is awaited, never blocked on — an idle sidecar waiting for
-    /// the next line still yields to the settlement tasks the replies
-    /// spawned.
+    /// `dispatch`'s buffered path: same preparation and registry as the
+    /// serve loop, awaited inline for callers that drive dispatch
+    /// themselves.
+    async fn dispatch_buffered(&self, id: Value, params: &Value) -> Value {
+        let prepared = match self.prepare_chat(params) {
+            Ok(prepared) => prepared,
+            Err(error) => return error_reply(id, &error.to_string()),
+        };
+        let key = id_key(&id);
+        if !self.register(&key, &prepared.control) {
+            return error_reply(id, "request id in-flight");
+        }
+        let result =
+            buffered_result(&self.meter, &self.settle, self.upstream_deadline, prepared).await;
+        if let Ok(mut table) = self.inflight.lock() {
+            table.remove(&key);
+        }
+        reply(id, result)
+    }
+
+    /// The stdin loop: unary requests answer inline; chat requests run on
+    /// their own task so one slow upstream never serializes the gateway —
+    /// replies and stream frames for different requests may interleave,
+    /// correlate by `id`. EOF drains in-flight work to completion; the
+    /// sidecar cancels nothing on its own.
     pub async fn serve(
         &self,
         mut input: impl AsyncBufRead + Unpin,
-        mut output: impl AsyncWrite + Unpin,
+        output: impl AsyncWrite + Unpin + Send + 'static,
     ) -> std::io::Result<()> {
+        let writer: SharedWriter = Arc::new(tokio::sync::Mutex::new(Box::new(output)));
         let mut line = Vec::new();
         loop {
             line.clear();
             match read_capped_line(&mut input, &mut line).await? {
-                InputLine::Eof => return Ok(()),
+                InputLine::Eof => break,
                 InputLine::Oversized => {
                     write_line(
-                        &mut output,
+                        &writer,
                         &json!({"id": null, "error": format!("bad request line: exceeds {MAX_LINE_BYTES} bytes")}),
                     )
                     .await?;
@@ -203,7 +324,7 @@ impl Service {
             }
             let Ok(text) = std::str::from_utf8(&line) else {
                 write_line(
-                    &mut output,
+                    &writer,
                     &json!({"id": null, "error": "bad request line: not utf-8"}),
                 )
                 .await?;
@@ -216,7 +337,7 @@ impl Service {
                 Ok(value) => value,
                 Err(error) => {
                     write_line(
-                        &mut output,
+                        &writer,
                         &json!({"id": null, "error": format!("bad request line: {error}")}),
                     )
                     .await?;
@@ -226,9 +347,69 @@ impl Service {
             let id = request.get("id").cloned().unwrap_or(Value::Null);
             let method = request.get("method").and_then(Value::as_str);
             let params = request.get("params").cloned().unwrap_or(Value::Null);
-            let reply = self.dispatch(id, method, &params).await;
-            write_line(&mut output, &reply).await?;
+            match method {
+                Some("chat.complete") | Some("chat.stream") => {
+                    let prepared = match self.prepare_chat(&params) {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            write_line(&writer, &error_reply(id, &error.to_string())).await?;
+                            continue;
+                        }
+                    };
+                    let key = id_key(&id);
+                    if !self.register(&key, &prepared.control) {
+                        write_line(&writer, &error_reply(id, "request id in-flight")).await?;
+                        continue;
+                    }
+                    self.reap_forward();
+                    let meter = Arc::clone(&self.meter);
+                    let settle = Arc::clone(&self.settle);
+                    let inflight = Arc::clone(&self.inflight);
+                    let deadline = self.upstream_deadline;
+                    let task_writer = Arc::clone(&writer);
+                    match method {
+                        Some("chat.complete") => {
+                            let task = async move {
+                                let result =
+                                    buffered_result(&meter, &settle, deadline, prepared).await;
+                                let _ = write_line(&task_writer, &reply(id, result)).await;
+                                if let Ok(mut table) = inflight.lock() {
+                                    table.remove(&key);
+                                }
+                            };
+                            if let Ok(mut tasks) = self.forward.lock() {
+                                tasks.spawn(task);
+                            }
+                        }
+                        _ => {
+                            let task = async move {
+                                run_stream(&task_writer, &meter, &settle, deadline, id, prepared)
+                                    .await;
+                                if let Ok(mut table) = inflight.lock() {
+                                    table.remove(&key);
+                                }
+                            };
+                            if let Ok(mut tasks) = self.forward.lock() {
+                                tasks.spawn(task);
+                            }
+                        }
+                    }
+                }
+                other => {
+                    let reply = self.dispatch(id, other, &params).await;
+                    write_line(&writer, &reply).await?;
+                }
+            }
         }
+        // In-flight work runs to completion — its replies still belong on
+        // the wire.
+        let mut drained = self
+            .forward
+            .lock()
+            .map(|mut tasks| std::mem::replace(&mut *tasks, JoinSet::new()))
+            .unwrap_or_default();
+        while drained.join_next().await.is_some() {}
+        Ok(())
     }
 
     /// Drain pending settlement tasks and persist the counters. The
@@ -280,58 +461,6 @@ impl Service {
         Ok(json!({ "models": models }))
     }
 
-    /// Forward one chat request: resolve the route, count the admission,
-    /// call the adapter under the upstream deadline, spawn the settlement
-    /// beside the reply.
-    async fn chat_complete(&self, params: &Value) -> Result<Value> {
-        let model = params
-            .get("model")
-            .and_then(Value::as_str)
-            .ok_or_else(|| Error::Request("chat.complete requires a model".to_owned()))?;
-        let bound = self.router.resolve(model)?;
-        let agent = params
-            .get("agent")
-            .and_then(Value::as_str)
-            .unwrap_or("stdio");
-        // Admission is the accept event: the request exists only once it
-        // parses — a payload the gateway rejects is never counted as
-        // forwarded traffic.
-        let request = chat_request(&bound.upstream_model, params)?;
-        self.meter.admit_request(agent, model);
-        let control = a4mp::RequestControl::default();
-        let output = match self.upstream_deadline {
-            Some(deadline) => {
-                match tokio::time::timeout(deadline, bound.adapter.chat(request, &control)).await {
-                    Ok(output) => output?,
-                    Err(_) => {
-                        // The provider call is dead work now: cancel it and
-                        // let the caller decide whether the request retries —
-                        // one hung upstream never becomes an unbounded outage
-                        // of the whole gateway.
-                        control.cancel.cancel();
-                        return Err(Error::UpstreamDeadline(deadline));
-                    }
-                }
-            }
-            None => bound.adapter.chat(request, &control).await?,
-        };
-        // Settlement is ordered after the response exists and runs on its
-        // own task: the reply never waits on the journal.
-        let meter = Arc::clone(&self.meter);
-        let provider = bound.provider.as_str().to_owned();
-        let usage = output.usage.clone();
-        if let Ok(mut tasks) = self.settle.lock() {
-            tasks.spawn(async move {
-                meter.settle_response(&provider, usage.as_ref()).await;
-            });
-        } else {
-            // The settlement never spawned: a metering failure like any
-            // other — counted, never propagated into the reply.
-            self.meter.count_failure();
-        }
-        Ok(output_json(&bound, &output))
-    }
-
     /// The exposition text a host mounts at `/metrics`. Pending
     /// settlements drain before the projection so a scrape that follows
     /// a forward sees the settled counters, not a mid-flight journal.
@@ -344,13 +473,19 @@ impl Service {
     }
 }
 
+/// The reply channel every writer shares: each line is written and
+/// flushed under one lock so frames and replies never interleave
+/// mid-line.
+type SharedWriter = Arc<tokio::sync::Mutex<Box<dyn AsyncWrite + Unpin + Send>>>;
+
 /// One reply line on the wire: the serialized object plus its newline,
-/// written and flushed as one await pair.
-async fn write_line(output: &mut (impl AsyncWrite + Unpin), value: &Value) -> std::io::Result<()> {
+/// written and flushed as one await pair under the shared lock.
+async fn write_line(writer: &SharedWriter, value: &Value) -> std::io::Result<()> {
     let mut line = value.to_string();
     line.push('\n');
-    output.write_all(line.as_bytes()).await?;
-    output.flush().await
+    let mut guard = writer.lock().await;
+    guard.write_all(line.as_bytes()).await?;
+    guard.flush().await
 }
 
 /// A reply carrying a result or the error text — the aor.rs convention:
@@ -366,171 +501,251 @@ fn error_reply(id: Value, error: &str) -> Value {
     json!({ "id": id, "error": error })
 }
 
-/// Parse a request's messages into the canonical chat request. The
-/// outward shape is deliberately small — `{role, text}` messages, common
-/// sampling keys, and an `extensions` object forwarded verbatim so
-/// provider-native fields never die at the gateway's own parser.
-fn chat_request(upstream_model: &str, params: &Value) -> Result<a4mp::ChatRequest> {
-    let invalid = |field: &str| Error::Request(format!("chat.complete: {field}"));
-    let messages = params
-        .get("messages")
-        .and_then(Value::as_array)
-        .ok_or_else(|| invalid("requires messages"))?;
-    let mut parsed = Vec::with_capacity(messages.len());
-    for message in messages {
-        let role = match message.get("role").and_then(Value::as_str) {
-            Some("system") => a4mp::Role::System,
-            Some("user") => a4mp::Role::User,
-            Some("assistant") => a4mp::Role::Assistant,
-            Some(other) => a4mp::Role::Other(other.to_owned()),
-            None => return Err(invalid("message requires a role")),
-        };
-        let text = message
-            .get("text")
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid("message requires text"))?;
-        parsed.push(a4mp::Message::text(role, text));
-    }
-    let sampling = a4mp::Sampling {
-        temperature: params
-            .get("temperature")
-            .and_then(Value::as_f64)
-            .map(|value| value as f32),
-        top_p: params
-            .get("topP")
-            .and_then(Value::as_f64)
-            .map(|value| value as f32),
-        max_output_tokens: params
-            .get("maxOutputTokens")
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok()),
-        stop: params
-            .get("stop")
-            .and_then(Value::as_array)
-            .map(|stop| {
-                stop.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
+/// In-flight requests register under their request id's JSON form so a
+/// `chat.cancel` names the exact same key.
+fn id_key(id: &Value) -> String {
+    id.to_string()
+}
+
+/// Conversion losses on the wire: explicit paths, never silent drops.
+fn losses_json(losses: &[a4mp::ConversionLoss]) -> Value {
+    Value::Array(
+        losses
+            .iter()
+            .map(|loss| {
+                json!({
+                    "path": loss.path,
+                    "kind": match loss.kind {
+                        a4mp::LossKind::Unsupported => "unsupported",
+                        a4mp::LossKind::Lossy => "lossy",
+                    },
+                })
             })
-            .unwrap_or_default(),
-    };
-    let extensions = params
-        .get("extensions")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    Ok(a4mp::ChatRequest {
-        model: upstream_model.to_owned(),
-        messages: parsed,
-        sampling,
-        extensions,
-        ..Default::default()
-    })
+            .collect(),
+    )
 }
 
-/// The response a caller sees: text and parts verbatim, usage unhidden,
-/// provider-native extensions passed through — a gateway relays, it does
-/// not editorialize.
-fn output_json(bound: &BoundRoute, output: &a4mp::Output) -> Value {
-    let parts: Vec<Value> = output
-        .parts
-        .iter()
-        .map(|part| match part {
-            a4mp::ContentPart::Text { text } => json!({ "type": "text", "text": text }),
-            a4mp::ContentPart::ToolCall(call) => json!({
-                "type": "toolCall",
-                "id": call.id,
-                "name": call.name,
-                "arguments": call.arguments,
-            }),
-            a4mp::ContentPart::ToolResult(result) => json!({
-                "type": "toolResult",
-                "callId": result.call_id,
-                "isError": result.is_error,
-            }),
-            a4mp::ContentPart::Media { kind, .. } => {
-                json!({ "type": "media", "kind": format!("{kind:?}") })
-            }
-            // Opaque reasoning state is never flattened into visible text —
-            // it relays as a marker, not its payload.
-            a4mp::ContentPart::Reasoning(_) => json!({ "type": "reasoning" }),
-            _ => json!({ "type": "other" }),
-        })
-        .collect();
-    let text = output
-        .parts
-        .iter()
-        .filter_map(|part| match part {
-            a4mp::ContentPart::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<String>();
-    json!({
-        "provider": bound.provider.as_str(),
-        "model": bound.upstream_model,
-        "text": text,
-        "parts": parts,
-        "stopReason": output.stop.as_ref().map(stop_label),
-        "usage": usage_json(&output.usage),
-        "extensions": output.extensions,
-    })
+/// One relayed SSE frame as a reply line — the dialect's own frame
+/// fields, verbatim.
+fn frame_line(id: &Value, event: &a4mp::SseEvent) -> Value {
+    json!({"id": id, "stream": "data",
+           "frame": {"event": event.event, "id": event.id, "data": event.data}})
 }
 
-fn stop_label(stop: &a4mp::StopReason) -> String {
-    match stop {
-        a4mp::StopReason::Complete => "complete".to_owned(),
-        a4mp::StopReason::Length => "length".to_owned(),
-        a4mp::StopReason::ToolUse => "tool-use".to_owned(),
-        a4mp::StopReason::Filtered => "filtered".to_owned(),
-        a4mp::StopReason::Paused => "paused".to_owned(),
-        a4mp::StopReason::Other(reason) => format!("other:{reason}"),
-        _ => "other".to_owned(),
+/// The terminal line of one stream — exactly one per `chat.stream` that
+/// produced any frame.
+fn end_line(
+    id: &Value,
+    status: &str,
+    losses: &[a4mp::ConversionLoss],
+    error: Option<&str>,
+) -> Value {
+    let mut line = json!({"id": id, "stream": "end", "status": status,
+                          "losses": losses_json(losses)});
+    if let Some(error) = error {
+        line["error"] = Value::String(error.to_owned());
+    }
+    line
+}
+
+/// Settlement is ordered after the response exists and runs on its own
+/// task: the reply never waits on the journal. A lock that cannot be
+/// taken is a metering failure like any other — counted, never
+/// propagated.
+fn spawn_settle(
+    meter: &Arc<Meter>,
+    settle: &Mutex<JoinSet<()>>,
+    provider: String,
+    usage: Option<a4mp::Usage>,
+) {
+    let meter = Arc::clone(meter);
+    if let Ok(mut tasks) = settle.lock() {
+        tasks.spawn(async move {
+            meter.settle_response(&provider, usage.as_ref()).await;
+        });
+    } else {
+        meter.count_failure();
     }
 }
 
-/// Usage on the wire: the canonical counters plus every provider-native
-/// field — absent counters stay absent, they are never zeroed. Shares
-/// [`usage_object`] with the settlement record so an extension key can
-/// never overwrite a real count in either projection.
-fn usage_json(usage: &Option<a4mp::Usage>) -> Value {
-    usage
-        .as_ref()
-        .map(|usage| Value::Object(usage_object(usage, UsageKeyStyle::Reply)))
-        .unwrap_or(Value::Null)
+/// What `chat.complete`/`chat.stream` need after the line is read:
+/// dialect, decoded request with the upstream model id, route, decode
+/// losses and a fresh control token.
+struct PreparedChat {
+    bound: BoundRoute,
+    request: a4mp::ChatRequest,
+    client_model: String,
+    dialect: a4mp::wire::WireDialect,
+    losses: Vec<a4mp::ConversionLoss>,
+    control: a4mp::RequestControl,
+}
+
+/// How one streaming call ended — the `stream:"end"` status names it.
+enum PumpOutcome {
+    Done,
+    Ended(a4mp::Error),
+    Deadline,
+    WriteFailed,
+}
+
+/// What the pump accumulated while it ran. Lives outside the deadline
+/// future so a fired bound still reports the frames, usage and losses it
+/// already observed.
+struct PumpState {
+    /// Whether any `stream:"data"` line reached the wire.
+    wrote_frame: bool,
+    /// The last usage event the provider reported, if any.
+    last_usage: Option<a4mp::Usage>,
+    /// Decode losses plus every encode loss the dialect emitted.
+    losses: Vec<a4mp::ConversionLoss>,
+}
+
+/// The buffered forward: one upstream call under the host's opt-in
+/// deadline, then the dialect response body plus every conversion loss.
+async fn buffered_result(
+    meter: &Arc<Meter>,
+    settle: &Mutex<JoinSet<()>>,
+    deadline: Option<Duration>,
+    prepared: PreparedChat,
+) -> Result<Value> {
+    let adapter = Arc::clone(&prepared.bound.adapter);
+    let call = adapter.chat(prepared.request, &prepared.control);
+    let output = match deadline {
+        Some(deadline) => match tokio::time::timeout(deadline, call).await {
+            Err(_) => return Err(Error::UpstreamDeadline(deadline)),
+            Ok(result) => result?,
+        },
+        None => call.await?,
+    };
+    spawn_settle(
+        meter,
+        settle,
+        prepared.bound.provider.as_str().to_owned(),
+        output.usage.clone(),
+    );
+    let (body, encode_report) =
+        a4mp::wire::encode_chat_output(prepared.dialect, &output, &prepared.client_model);
+    let mut losses = prepared.losses;
+    losses.extend(encode_report.losses);
+    Ok(json!({ "body": body, "losses": losses_json(&losses) }))
+}
+
+/// The pump inside the stream task: dialect SSE frames as `stream:"data"`
+/// lines, tracking the last usage event and every encode loss. Returns
+/// how the stream ended; the caller writes the terminal line.
+async fn pump_frames(
+    writer: &SharedWriter,
+    id: &Value,
+    prepared: PreparedChat,
+    state: &mut PumpState,
+) -> PumpOutcome {
+    let PreparedChat {
+        bound,
+        request,
+        client_model,
+        dialect,
+        control,
+        ..
+    } = prepared;
+    let mut events = match bound.adapter.chat_stream(request, &control).await {
+        Ok(events) => events,
+        Err(error) => return PumpOutcome::Ended(error),
+    };
+    let mut encoder = a4mp::wire::stream_encoder(dialect, &client_model);
+    for frame in encoder.preamble() {
+        state.wrote_frame = true;
+        if write_line(writer, &frame_line(id, &frame)).await.is_err() {
+            return PumpOutcome::WriteFailed;
+        }
+    }
+    loop {
+        let item = std::future::poll_fn(|cx| Stream::poll_next(events.as_mut(), cx)).await;
+        match item {
+            Some(Ok(event)) => {
+                if let a4mp::StreamEvent::Usage(usage) = &event {
+                    state.last_usage = Some(usage.clone());
+                }
+                for frame in encoder.encode(&event) {
+                    state.wrote_frame = true;
+                    if write_line(writer, &frame_line(id, &frame)).await.is_err() {
+                        return PumpOutcome::WriteFailed;
+                    }
+                }
+                state.losses.extend(encoder.drain_losses());
+            }
+            Some(Err(error)) => return PumpOutcome::Ended(error),
+            None => break,
+        }
+    }
+    for frame in encoder.finish() {
+        state.wrote_frame = true;
+        if write_line(writer, &frame_line(id, &frame)).await.is_err() {
+            return PumpOutcome::WriteFailed;
+        }
+    }
+    state.losses.extend(encoder.drain_losses());
+    PumpOutcome::Done
+}
+
+/// The streaming forward: frames relayed live, then exactly one
+/// `stream:"end"` line — or the ordinary error reply when nothing ever
+/// framed. The last usage event settles once, on success, failure or
+/// cancel alike.
+async fn run_stream(
+    writer: &SharedWriter,
+    meter: &Arc<Meter>,
+    settle: &Mutex<JoinSet<()>>,
+    deadline: Option<Duration>,
+    id: Value,
+    mut prepared: PreparedChat,
+) {
+    let provider = prepared.bound.provider.as_str().to_owned();
+    let mut state = PumpState {
+        wrote_frame: false,
+        last_usage: None,
+        losses: std::mem::take(&mut prepared.losses),
+    };
+    let pump = pump_frames(writer, &id, prepared, &mut state);
+    let outcome = match deadline {
+        Some(d) => tokio::time::timeout(d, pump)
+            .await
+            .unwrap_or(PumpOutcome::Deadline),
+        None => pump.await,
+    };
+    spawn_settle(meter, settle, provider, state.last_usage);
+    match outcome {
+        PumpOutcome::Done => {
+            let _ = write_line(writer, &end_line(&id, "done", &state.losses, None)).await;
+        }
+        PumpOutcome::Deadline => {
+            let error = Error::UpstreamDeadline(deadline.unwrap_or_default()).to_string();
+            let line = if state.wrote_frame {
+                end_line(&id, "error", &state.losses, Some(&error))
+            } else {
+                error_reply(id, &error)
+            };
+            let _ = write_line(writer, &line).await;
+        }
+        PumpOutcome::Ended(error) => {
+            // Adapter failures surface through the same `adapter:`
+            // wrapper the buffered path reports — one error dialect on
+            // the wire, whether the call framed or not.
+            let status = matches!(error, a4mp::Error::Cancelled);
+            let message = Error::Adapter(error).to_string();
+            let line = match (state.wrote_frame, status) {
+                (true, true) => end_line(&id, "cancelled", &state.losses, Some(&message)),
+                (true, false) => end_line(&id, "error", &state.losses, Some(&message)),
+                (false, _) => error_reply(id, &message),
+            };
+            let _ = write_line(writer, &line).await;
+        }
+        PumpOutcome::WriteFailed => {}
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn chat_request_maps_the_outward_shape_verbatim() {
-        let request = chat_request(
-            "upstream-9",
-            &json!({
-                "messages": [
-                    {"role": "system", "text": "sys"},
-                    {"role": "user", "text": "hi"}
-                ],
-                "temperature": 0.5,
-                "maxOutputTokens": 64,
-                "extensions": {"vendor_flag": true}
-            }),
-        )
-        .expect("request");
-        assert_eq!(request.model, "upstream-9");
-        assert_eq!(request.messages.len(), 2);
-        assert_eq!(request.sampling.temperature, Some(0.5));
-        assert_eq!(request.sampling.max_output_tokens, Some(64));
-        assert_eq!(request.extensions["vendor_flag"], json!(true));
-    }
-
-    #[test]
-    fn malformed_messages_fail_closed() {
-        assert!(chat_request("m", &json!({})).is_err());
-        assert!(chat_request("m", &json!({"messages": [{}]})).is_err());
-    }
 
     #[tokio::test]
     async fn capped_reads_bound_a_hostile_line_and_recover() {
@@ -597,34 +812,5 @@ mod tests {
             read_capped_line(&mut input, &mut line).await.expect("read"),
             InputLine::Eof
         ));
-    }
-
-    #[test]
-    fn reply_usage_extensions_cannot_overwrite_the_canonical_counts() {
-        // The reply projection carries the same canonical-key guard the
-        // settlement record does — a provider extension naming
-        // `inputTokens` never replaces the counted value.
-        let mut extensions = serde_json::Map::new();
-        extensions.insert("inputTokens".to_owned(), 999.into());
-        extensions.insert("cacheReadInputTokens".to_owned(), 7.into());
-        let usage = usage_json(&Some(a4mp::Usage {
-            input_tokens: Some(10),
-            output_tokens: Some(5),
-            extensions,
-        }));
-        assert_eq!(usage["inputTokens"], json!(10));
-        assert_eq!(usage["outputTokens"], json!(5));
-        assert_eq!(usage["cacheReadInputTokens"], json!(7));
-
-        // A provider-native field naming an absent counter still
-        // forwards under its own spelling — nothing was overwritten.
-        let mut extensions = serde_json::Map::new();
-        extensions.insert("inputTokens".to_owned(), 9.into());
-        let usage = usage_json(&Some(a4mp::Usage {
-            input_tokens: None,
-            output_tokens: None,
-            extensions,
-        }));
-        assert_eq!(usage["inputTokens"], json!(9));
     }
 }

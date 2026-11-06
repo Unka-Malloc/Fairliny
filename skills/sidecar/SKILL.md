@@ -1,6 +1,6 @@
 ---
 name: fairliny-sidecar
-description: Drive the fairliny gateway from any language — `fairliny serve` is an NDJSON stdio sidecar exposing models.list, chat.complete and metrics.exposition.
+description: Drive the fairliny gateway from any language — `fairliny serve` is an NDJSON stdio sidecar exposing models.list, chat.complete, chat.stream, chat.cancel and metrics.exposition.
 ---
 
 # fairliny Sidecar mode
@@ -23,10 +23,19 @@ JSON reply per stdout line.
   EOF ends the process.
 - `models.list` — the bound route table: configured surfaces and
   prebound adapters, never a provider discovery.
-- `chat.complete` — `params.model` names the outward model,
-  `params.messages` carries `{role, text}` entries plus common sampling
-  keys and an `extensions` object forwarded verbatim;
-  `params.agent` attributes the admission (default `"stdio"`).
+- `chat.complete` / `chat.stream` — `params` is
+  `{dialect, body, agent?}`: `dialect` is one of
+  `openai-chat-completions`, `openai-responses`, `anthropic-messages`;
+  `body` is that dialect's full request object whose `model` field names
+  the outward model; `agent` attributes the admission (default
+  `"stdio"`). `chat.complete` answers `{body, losses}` — the dialect
+  response plus every conversion loss the wire codecs reported.
+  `chat.stream` relays the dialect's SSE frames as
+  `{"stream":"data","frame":{event,id,data}}` lines, then exactly one
+  `{"stream":"end","status":"done|error|cancelled","losses":[...]}`.
+  Frames and other requests' replies may interleave — correlate by `id`.
+- `chat.cancel` — `params.requestId` names the in-flight request's `id`;
+  answers `{cancelled: true}` or an `unknown in-flight request` error.
 - `metrics.exposition` — `{contentType, exposition}`; the host mounts
   the text at its own `/metrics` route.
 
@@ -44,6 +53,7 @@ JSON reply per stdout line.
 - A malformed route entry refuses startup rather than running half a
   route table; unknown models and unaccepted auth mechanisms fail
   closed.
-- `upstreamDeadlineSecs` in the routes document bounds one upstream
-  provider call (default `600`, `0` waits unbounded) — the knob that
-  keeps one hung provider from stalling the gateway.
+- `upstreamDeadlineSecs` in the routes document is the host's opt-in
+  bound on one upstream provider call: absent or `0` waits unbounded —
+  a viable call ends by caller cancellation or provider answer, never by
+  a deadline the sidecar invented.

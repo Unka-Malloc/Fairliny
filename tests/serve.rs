@@ -112,27 +112,171 @@ fn handoff_bytes(epoch: &str) -> Vec<u8> {
     handoff.to_json().expect("document").expose_bytes().to_vec()
 }
 
+/// The target every test adapter claims — a prebound stub surface.
+fn stub_target() -> a4mp::ServiceTarget {
+    a4mp::ServiceTarget::new(
+        "stub",
+        a4mp::Protocol::Other("stub".to_owned()),
+        url::Url::parse("https://stub.invalid/").expect("url"),
+    )
+}
+
+/// Bind `adapter` under the `ping-model`/`upstream-ping` pair — the
+/// outward name every chat test forwards through. The transport is real
+/// but never invoked — every test route is prebound.
+fn test_router_with(
+    resolver: Arc<dyn a4mp::CredentialResolver>,
+    adapter: Arc<dyn a4mp::Adapter>,
+) -> Router {
+    let transport = Arc::new(a4mp::ReqwestTransport::new());
+    let mut router = Router::new(transport, resolver);
+    router.register_adapter("ping-model", "upstream-ping", adapter);
+    router
+}
+
 /// A router over the stub: the outward name `ping-model` forwards to the
-/// stub adapter as `upstream-ping`. The transport is real but never
-/// invoked — every test route is prebound.
+/// stub adapter as `upstream-ping`.
 fn test_router(
     resolver: Arc<dyn a4mp::CredentialResolver>,
     requests: Arc<Mutex<Vec<a4mp::ChatRequest>>>,
 ) -> Router {
-    let transport = Arc::new(a4mp::ReqwestTransport::new());
-    let mut router = Router::new(transport, Arc::clone(&resolver));
     let adapter = Arc::new(StubAdapter {
-        target: a4mp::ServiceTarget::new(
-            "stub",
-            a4mp::Protocol::Other("stub".to_owned()),
-            url::Url::parse("https://stub.invalid/").expect("url"),
-        ),
-        resolver,
+        target: stub_target(),
+        resolver: Arc::clone(&resolver),
         requests,
         output: reply_output(),
     });
-    router.register_adapter("ping-model", "upstream-ping", adapter);
-    router
+    test_router_with(resolver, adapter)
+}
+
+/// A resolver holding one installed API-key lease — the working custody
+/// answer an adapter expects per call.
+fn resolver_with_lease() -> Arc<dyn a4mp::CredentialResolver> {
+    let epoch = Arc::new(Epochs {
+        current: Mutex::new(uuid::Uuid::new_v4().to_string()),
+    });
+    let leases = Leases::disconnected();
+    let epoch_id = epoch.current.lock().unwrap().clone();
+    leases
+        .install_handoff(&handoff_bytes(&epoch_id), epoch)
+        .expect("install");
+    Arc::new(leases)
+}
+
+/// `{dialect, body, agent?}` params for a chat request.
+fn chat_params(body: serde_json::Value, agent: Option<&str>) -> serde_json::Value {
+    let mut params = serde_json::json!({"dialect": "openai-chat-completions", "body": body});
+    if let Some(agent) = agent {
+        params["agent"] = agent.into();
+    }
+    params
+}
+
+/// The reply line carrying `id`, wherever multiplexing placed it.
+fn reply_for(replies: &[serde_json::Value], id: i64) -> &serde_json::Value {
+    replies
+        .iter()
+        .find(|r| r["id"] == id)
+        .expect("reply for id")
+}
+
+/// One request line carrying `params` for `method`.
+fn request_line(id: i64, method: &str, params: serde_json::Value) -> Vec<u8> {
+    let mut line = serde_json::json!({"id": id, "method": method, "params": params})
+        .to_string()
+        .into_bytes();
+    line.push(b'\n');
+    line
+}
+
+/// A scripted canonical event stream — the shape an adapter hands the
+/// dialect encoder.
+struct ScriptedStream {
+    events: std::collections::VecDeque<std::result::Result<a4mp::StreamEvent, a4mp::Error>>,
+}
+
+impl futures_core::Stream for ScriptedStream {
+    type Item = std::result::Result<a4mp::StreamEvent, a4mp::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::task::Poll::Ready(self.events.pop_front())
+    }
+}
+
+/// A stream that pends until the request's own control token cancels —
+/// the cancel path a hung upstream takes.
+struct StallStream {
+    wait: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+}
+
+impl futures_core::Stream for StallStream {
+    type Item = std::result::Result<a4mp::StreamEvent, a4mp::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match self.wait.as_mut().poll(cx) {
+            std::task::Poll::Ready(()) => std::task::Poll::Ready(Some(Err(a4mp::Error::Cancelled))),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+/// Streams for `chat_stream`: scripted events, or a stall that only the
+/// caller's cancel token ends. `chat` behaves like the stub.
+struct StreamAdapter {
+    target: a4mp::ServiceTarget,
+    resolver: Arc<dyn a4mp::CredentialResolver>,
+    requests: Arc<Mutex<Vec<a4mp::ChatRequest>>>,
+    events: Mutex<std::collections::VecDeque<std::result::Result<a4mp::StreamEvent, a4mp::Error>>>,
+    stall: bool,
+}
+
+#[async_trait::async_trait]
+impl a4mp::Adapter for StreamAdapter {
+    fn target(&self) -> &a4mp::ServiceTarget {
+        &self.target
+    }
+
+    async fn chat(
+        &self,
+        request: a4mp::ChatRequest,
+        _control: &a4mp::RequestControl,
+    ) -> std::result::Result<a4mp::Output, a4mp::Error> {
+        let scope = a4mp::CredentialScope {
+            target: &self.target,
+            auth: &a4mp::AuthKind::ApiKey,
+        };
+        self.resolver.resolve(scope).await?;
+        self.requests.lock().expect("requests").push(request);
+        Ok(a4mp::Output::default())
+    }
+
+    async fn chat_stream(
+        &self,
+        request: a4mp::ChatRequest,
+        control: &a4mp::RequestControl,
+    ) -> std::result::Result<a4mp::DynStream<'static, a4mp::StreamEvent>, a4mp::Error> {
+        let scope = a4mp::CredentialScope {
+            target: &self.target,
+            auth: &a4mp::AuthKind::ApiKey,
+        };
+        self.resolver.resolve(scope).await?;
+        self.requests.lock().expect("requests").push(request);
+        if self.stall {
+            Ok(Box::pin(StallStream {
+                wait: Box::pin(control.cancel.clone().cancelled_owned()),
+            }))
+        } else {
+            Ok(Box::pin(ScriptedStream {
+                events: self.events.lock().expect("events").drain(..).collect(),
+            }))
+        }
+    }
 }
 
 /// A meter settling into a scratch ledger under the test's own binding.
@@ -151,11 +295,21 @@ fn test_meter(root: &std::path::Path) -> Meter {
 
 /// Drive the service over an in-memory stream and collect the replies,
 /// then drain the settlement tasks so metering assertions see a settled
-/// journal rather than racing it.
+/// journal rather than racing it. The wire is a duplex channel the
+/// service owns — spawned chat tasks write through it from other tasks,
+/// so the reader drains it concurrently.
 async fn run(service: &Service, input: &[u8]) -> Vec<serde_json::Value> {
-    let mut output = Vec::new();
-    service.serve(input, &mut output).await.expect("serve loop");
+    let (writer, mut reader) = tokio::io::duplex(64 * 1024);
+    let collected = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buf)
+            .await
+            .expect("read replies");
+        buf
+    });
+    service.serve(input, writer).await.expect("serve loop");
     service.flush_metering().await;
+    let output = collected.await.expect("reader task");
     String::from_utf8(output)
         .expect("utf8")
         .lines()
@@ -180,13 +334,21 @@ async fn the_loop_answers_and_settles_one_forwarded_request() {
         test_meter(dir.path()),
     );
 
-    let replies = run(
-        &service,
-        br#"{"id":1,"method":"models.list","params":{}}
-{"id":2,"method":"chat.complete","params":{"model":"ping-model","agent":"caller","messages":[{"role":"user","text":"hi"}]}}
-"#,
-    )
-    .await;
+    let mut input = br#"{"id":1,"method":"models.list","params":{}}
+"#
+    .to_vec();
+    input.extend_from_slice(&request_line(
+        2,
+        "chat.complete",
+        chat_params(
+            serde_json::json!({
+                "model": "ping-model",
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+            Some("caller"),
+        ),
+    ));
+    let replies = run(&service, &input).await;
 
     let models = &replies[0]["result"]["models"][0];
     assert_eq!(models["id"], "ping-model");
@@ -194,9 +356,13 @@ async fn the_loop_answers_and_settles_one_forwarded_request() {
     assert_eq!(models["upstreamModel"], "upstream-ping");
 
     let result = &replies[1]["result"];
-    assert_eq!(result["text"], "pong");
-    assert_eq!(result["model"], "upstream-ping");
-    assert_eq!(result["usage"]["inputTokens"], 3);
+    let body = &result["body"];
+    assert_eq!(body["choices"][0]["message"]["content"], "pong");
+    // The dialect body echoes the client's own outward model name.
+    assert_eq!(body["model"], "ping-model");
+    assert_eq!(body["usage"]["prompt_tokens"], 3);
+    assert_eq!(body["usage"]["completion_tokens"], 1);
+    assert!(result["losses"].is_array());
     // The outward model name was rewritten to the upstream id.
     assert_eq!(requests.lock().unwrap()[0].model, "upstream-ping");
 
@@ -306,11 +472,23 @@ async fn a_failed_meter_never_fails_the_reply() {
     );
     let replies = run(
         &service,
-        br#"{"id":1,"method":"chat.complete","params":{"model":"ping-model","messages":[{"role":"user","text":"hi"}]}}
-"#,
+        &request_line(
+            1,
+            "chat.complete",
+            chat_params(
+                serde_json::json!({
+                    "model": "ping-model",
+                    "messages": [{"role": "user", "content": "hi"}]
+                }),
+                None,
+            ),
+        ),
     )
     .await;
-    assert_eq!(replies[0]["result"]["text"], "pong");
+    assert_eq!(
+        replies[0]["result"]["body"]["choices"][0]["message"]["content"],
+        "pong"
+    );
     assert!(service.meter().failure_count() >= 1);
     assert!(service.meter().facts().is_empty());
 }
@@ -324,21 +502,37 @@ async fn an_unresolved_credential_or_model_fails_closed() {
     );
     // No lease is installed: the credential resolver refuses, and an
     // unknown model is refused before any adapter is touched.
-    let replies = run(
-        &service,
-        br#"{"id":1,"method":"chat.complete","params":{"model":"ping-model","messages":[{"role":"user","text":"hi"}]}}
-{"id":2,"method":"chat.complete","params":{"model":"no-such-model","messages":[{"role":"user","text":"hi"}]}}
-"#,
-    )
-    .await;
+    let mut input = request_line(
+        1,
+        "chat.complete",
+        chat_params(
+            serde_json::json!({
+                "model": "ping-model",
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+            None,
+        ),
+    );
+    input.extend_from_slice(&request_line(
+        2,
+        "chat.complete",
+        chat_params(
+            serde_json::json!({
+                "model": "no-such-model",
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+            None,
+        ),
+    ));
+    let replies = run(&service, &input).await;
     assert!(
-        replies[0]["error"]
+        reply_for(&replies, 1)["error"]
             .as_str()
             .unwrap()
             .contains("credential_lease_unavailable")
     );
     assert!(
-        replies[1]["error"]
+        reply_for(&replies, 2)["error"]
             .as_str()
             .unwrap()
             .contains("unknown model")
@@ -386,18 +580,35 @@ async fn a_scrape_right_after_a_forward_sees_the_settled_counters() {
         test_meter(dir.path()),
     );
 
-    // The exposition request arrives on the same stream right behind
-    // the forward — the answer must already carry the settled record,
-    // not a mid-flight journal.
-    let replies = run(
-        &service,
-        br#"{"id":1,"method":"chat.complete","params":{"model":"ping-model","agent":"caller","messages":[{"role":"user","text":"hi"}]}}
-{"id":2,"method":"metrics.exposition"}
-"#,
-    )
-    .await;
-    assert_eq!(replies[0]["result"]["text"], "pong");
-    let exposition = replies[1]["result"]["exposition"]
+    // The exposition request arrives right behind the forward — the
+    // answer must already carry the settled record, not a mid-flight
+    // journal. `dispatch` awaits the buffered forward inline, so the
+    // settlement was spawned before the scrape drains it.
+    let first = service
+        .dispatch(
+            serde_json::json!(1),
+            Some("chat.complete"),
+            &chat_params(
+                serde_json::json!({
+                    "model": "ping-model",
+                    "messages": [{"role": "user", "content": "hi"}]
+                }),
+                Some("caller"),
+            ),
+        )
+        .await;
+    let second = service
+        .dispatch(
+            serde_json::json!(2),
+            Some("metrics.exposition"),
+            &serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(
+        first["result"]["body"]["choices"][0]["message"]["content"],
+        "pong"
+    );
+    let exposition = second["result"]["exposition"]
         .as_str()
         .expect("exposition text");
     assert!(
@@ -427,11 +638,13 @@ async fn settlement_tracking_stays_bounded_across_forwards() {
         test_meter(dir.path()),
     );
 
-    let params = serde_json::json!({
-        "model": "ping-model",
-        "agent": "caller",
-        "messages": [{"role": "user", "text": "hi"}]
-    });
+    let params = chat_params(
+        serde_json::json!({
+            "model": "ping-model",
+            "messages": [{"role": "user", "content": "hi"}]
+        }),
+        Some("caller"),
+    );
     for _ in 0..32 {
         service
             .dispatch(serde_json::json!(1), Some("chat.complete"), &params)
@@ -470,22 +683,28 @@ async fn a_hung_upstream_errors_on_the_deadline_and_the_loop_recovers() {
     let service = Service::new(router, Meter::unmetered())
         .with_upstream_deadline(Some(Duration::from_millis(50)));
 
-    let replies = run(
-        &service,
-        br#"{"id":1,"method":"chat.complete","params":{"model":"hang-model","messages":[{"role":"user","text":"hi"}]}}
-{"id":2,"method":"models.list"}
-"#,
-    )
-    .await;
+    let mut input = request_line(
+        1,
+        "chat.complete",
+        chat_params(
+            serde_json::json!({
+                "model": "hang-model",
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+            None,
+        ),
+    );
+    input.extend_from_slice(b"{\"id\":2,\"method\":\"models.list\"}\n");
+    let replies = run(&service, &input).await;
     assert!(
-        replies[0]["error"]
+        reply_for(&replies, 1)["error"]
             .as_str()
             .expect("deadline error")
             .contains("upstream deadline"),
         "the hung call answers with the deadline error: {replies:?}"
     );
     // The hung call did not poison the loop — the next request answers.
-    assert!(replies[1]["result"]["models"].is_array());
+    assert!(reply_for(&replies, 2)["result"]["models"].is_array());
 }
 
 #[tokio::test]
@@ -495,12 +714,16 @@ async fn a_rejected_request_is_not_counted_as_forwarded() {
         test_router(resolver, Arc::new(Mutex::new(Vec::new()))),
         Meter::unmetered(),
     );
-    // `chat.complete` without `messages` is refused at the request parser
-    // — the request was never admitted, so nothing counts it.
+    // `chat.complete` with a body the dialect cannot decode is refused at
+    // the wire codec — the request was never admitted, so nothing counts
+    // it.
     let replies = run(
         &service,
-        br#"{"id":1,"method":"chat.complete","params":{"model":"ping-model"}}
-"#,
+        &request_line(
+            1,
+            "chat.complete",
+            chat_params(serde_json::json!({"model": "ping-model"}), None),
+        ),
     )
     .await;
     assert!(replies[0]["error"].is_string());
@@ -656,4 +879,361 @@ fn a_route_naming_an_unknown_provider_fails_closed() {
     let error = router.add_route("model", route).expect_err("closed");
     assert!(error.to_string().contains("unknown provider"));
     assert!(router.resolve("model").is_err());
+}
+
+/// A `StreamAdapter` bound under the test target: `events` script the
+/// canonical stream, `stall` switches to the cancel-only stream.
+fn stream_adapter(
+    resolver: Arc<dyn a4mp::CredentialResolver>,
+    requests: Arc<Mutex<Vec<a4mp::ChatRequest>>>,
+    events: Vec<std::result::Result<a4mp::StreamEvent, a4mp::Error>>,
+    stall: bool,
+) -> Arc<StreamAdapter> {
+    Arc::new(StreamAdapter {
+        target: stub_target(),
+        resolver,
+        requests,
+        events: Mutex::new(events.into_iter().collect()),
+        stall,
+    })
+}
+
+/// The scripted canonical stream every streaming test shares: a text
+/// part, a tool call, tail usage, a clean finish.
+fn scripted_events() -> Vec<std::result::Result<a4mp::StreamEvent, a4mp::Error>> {
+    vec![
+        Ok(a4mp::StreamEvent::PartStarted {
+            index: 0,
+            kind: a4mp::PartKind::Text,
+        }),
+        Ok(a4mp::StreamEvent::TextDelta {
+            index: 0,
+            text: "po".to_owned(),
+        }),
+        Ok(a4mp::StreamEvent::TextDelta {
+            index: 0,
+            text: "ng".to_owned(),
+        }),
+        Ok(a4mp::StreamEvent::ToolCallStarted {
+            index: 1,
+            id: "c1".to_owned(),
+            name: "lookup".to_owned(),
+        }),
+        Ok(a4mp::StreamEvent::ToolCallDelta {
+            index: 1,
+            arguments: "{}".to_owned(),
+        }),
+        Ok(a4mp::StreamEvent::PartFinished { index: 0 }),
+        Ok(a4mp::StreamEvent::PartFinished { index: 1 }),
+        Ok(a4mp::StreamEvent::Usage(a4mp::Usage {
+            input_tokens: Some(3),
+            output_tokens: Some(1),
+            extensions: Default::default(),
+        })),
+        Ok(a4mp::StreamEvent::Finished {
+            stop: Some(a4mp::StopReason::Complete),
+        }),
+    ]
+}
+
+/// A chat body naming the bound model plus one user message.
+fn stream_body() -> serde_json::Value {
+    serde_json::json!({
+        "model": "ping-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": true
+    })
+}
+
+/// Every `stream:"data"` frame's decoded `frame.data` for `id`, in wire
+/// order; `"[DONE]"` stays the literal string.
+fn frame_data(replies: &[serde_json::Value], id: i64) -> Vec<&str> {
+    replies
+        .iter()
+        .filter(|r| r["id"] == id && r["stream"] == "data")
+        .filter_map(|r| r["frame"]["data"].as_str())
+        .collect()
+}
+
+#[tokio::test]
+async fn chat_complete_relays_tools_and_choice_through_the_dialect() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let resolver = resolver_with_lease();
+    let adapter = Arc::new(StubAdapter {
+        target: stub_target(),
+        resolver: Arc::clone(&resolver),
+        requests: Arc::clone(&requests),
+        output: a4mp::Output {
+            parts: vec![
+                a4mp::ContentPart::Text {
+                    text: "pong".to_owned(),
+                },
+                a4mp::ContentPart::ToolCall(a4mp::ToolCall {
+                    id: "c1".to_owned(),
+                    name: "lookup".to_owned(),
+                    arguments: serde_json::json!({}),
+                }),
+            ],
+            stop: Some(a4mp::StopReason::ToolUse),
+            usage: Some(a4mp::Usage {
+                input_tokens: Some(3),
+                output_tokens: Some(1),
+                extensions: Default::default(),
+            }),
+            ..Default::default()
+        },
+    });
+    let service = Service::new(test_router_with(resolver, adapter), Meter::unmetered());
+
+    let replies = run(
+        &service,
+        &request_line(
+            1,
+            "chat.complete",
+            chat_params(
+                serde_json::json!({
+                    "model": "ping-model",
+                    "messages": [
+                        {"role": "user", "content": "hi"},
+                        {"role": "tool", "tool_call_id": "c1", "content": "ok"}
+                    ],
+                    "tools": [{
+                        "type": "function",
+                        "function": {"name": "lookup", "parameters": {"type": "object"}}
+                    }],
+                    "tool_choice": "auto",
+                    "parallel_tool_calls": false
+                }),
+                None,
+            ),
+        ),
+    )
+    .await;
+
+    // The dialect decoded into the canonical request: the tool
+    // definition, the choice and the parallel-call flag all survived.
+    let forwarded = &requests.lock().expect("requests")[0];
+    assert_eq!(forwarded.tools.len(), 1);
+    assert_eq!(forwarded.tool_choice, Some(a4mp::ToolChoice::Auto));
+    assert_eq!(forwarded.parallel_tool_calls, Some(false));
+    assert_eq!(forwarded.model, "upstream-ping");
+
+    let body = &reply_for(&replies, 1)["result"]["body"];
+    assert_eq!(
+        body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+        "lookup"
+    );
+    assert_eq!(body["usage"]["prompt_tokens"], 3);
+}
+
+#[tokio::test]
+async fn chat_stream_relays_dialect_frames_and_settles_tail_usage() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let resolver = resolver_with_lease();
+    let adapter = stream_adapter(
+        Arc::clone(&resolver),
+        Arc::clone(&requests),
+        scripted_events(),
+        false,
+    );
+    let service = Service::new(test_router_with(resolver, adapter), test_meter(dir.path()));
+
+    let replies = run(
+        &service,
+        &request_line(1, "chat.stream", chat_params(stream_body(), None)),
+    )
+    .await;
+
+    let frames = frame_data(&replies, 1);
+    let chunks: Vec<serde_json::Value> = frames
+        .iter()
+        .filter(|data| **data != "[DONE]")
+        .map(|data| serde_json::from_str(data).expect("chunk json"))
+        .collect();
+    assert!(
+        chunks.iter().any(|chunk| {
+            chunk["object"] == "chat.completion.chunk"
+                && chunk["choices"][0]["delta"]["content"] == "po"
+        }),
+        "a delta chunk carried the text: {frames:?}"
+    );
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| { chunk["choices"][0]["delta"]["tool_calls"].is_array() }),
+        "a delta chunk carried the tool call: {frames:?}"
+    );
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| chunk["usage"]["prompt_tokens"] == 3),
+        "the tail usage chunk: {frames:?}"
+    );
+    assert!(
+        frames.contains(&"[DONE]"),
+        "the stream terminator: {frames:?}"
+    );
+    let end = replies
+        .iter()
+        .filter(|r| r["id"] == 1 && r["stream"] == "end")
+        .collect::<Vec<_>>();
+    assert_eq!(end.len(), 1, "exactly one stream end line: {replies:?}");
+    assert_eq!(end[0]["status"], "done");
+    assert!(end[0]["losses"].is_array());
+
+    // The last usage event settled once, after the end line was written.
+    let facts = service.meter().facts();
+    assert!(
+        facts.iter().any(|fact| {
+            fact.scope_ref == "gateway:forwarded"
+                && fact.metric == token_usage_detector::metrics::TOKENS_INPUT
+                && fact.value.as_deref() == Some("3")
+        }),
+        "the settled input count is a fact: {facts:?}"
+    );
+}
+
+#[tokio::test]
+async fn chat_cancel_stops_an_in_flight_stream() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let resolver = resolver_with_lease();
+    let adapter = stream_adapter(
+        Arc::clone(&resolver),
+        Arc::clone(&requests),
+        Vec::new(),
+        true,
+    );
+    let service = Service::new(test_router_with(resolver, adapter), Meter::unmetered());
+
+    let mut input = request_line(1, "chat.stream", chat_params(stream_body(), None));
+    input
+        .extend_from_slice(b"{\"id\":2,\"method\":\"chat.cancel\",\"params\":{\"requestId\":1}}\n");
+    let replies = run(&service, &input).await;
+
+    assert_eq!(reply_for(&replies, 2)["result"]["cancelled"], true);
+    // The stall produced no frame, so the cancelled call answers the
+    // ordinary error shape rather than a stream end line.
+    let cancelled = reply_for(&replies, 1);
+    assert!(
+        cancelled["error"]
+            .as_str()
+            .expect("error text")
+            .contains("cancelled"),
+        "the cancelled stream answers the error reply: {cancelled}"
+    );
+    assert!(cancelled["stream"].is_null());
+}
+
+#[tokio::test]
+async fn a_duplicate_in_flight_id_is_refused() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let resolver = resolver_with_lease();
+    let adapter = stream_adapter(
+        Arc::clone(&resolver),
+        Arc::clone(&requests),
+        Vec::new(),
+        true,
+    );
+    let service = Service::new(test_router_with(resolver, adapter), Meter::unmetered());
+
+    let mut input = request_line(1, "chat.stream", chat_params(stream_body(), None));
+    input.extend_from_slice(&request_line(
+        1,
+        "chat.stream",
+        chat_params(stream_body(), None),
+    ));
+    input
+        .extend_from_slice(b"{\"id\":3,\"method\":\"chat.cancel\",\"params\":{\"requestId\":1}}\n");
+    let replies = run(&service, &input).await;
+
+    // The first id=1 line is the refusal — two requests never share one
+    // correlation key; the second is the cancelled call's own error.
+    assert_eq!(reply_for(&replies, 1)["error"], "request id in-flight");
+    assert_eq!(reply_for(&replies, 3)["result"]["cancelled"], true);
+}
+
+#[tokio::test]
+async fn a_stream_completes_after_input_eof() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let resolver = resolver_with_lease();
+    let adapter = stream_adapter(
+        Arc::clone(&resolver),
+        Arc::clone(&requests),
+        scripted_events(),
+        false,
+    );
+    let service = Service::new(test_router_with(resolver, adapter), Meter::unmetered());
+
+    // EOF right after the request line: the loop drains in-flight work
+    // to completion — it never cancels what the caller started.
+    let replies = run(
+        &service,
+        &request_line(1, "chat.stream", chat_params(stream_body(), None)),
+    )
+    .await;
+
+    let frames = frame_data(&replies, 1);
+    assert!(
+        frames.contains(&"[DONE]"),
+        "frames drained past EOF: {frames:?}"
+    );
+    let end = replies
+        .iter()
+        .find(|r| r["id"] == 1 && r["stream"] == "end")
+        .expect("stream end line");
+    assert_eq!(end["status"], "done");
+}
+
+#[tokio::test]
+async fn chat_cancel_names_an_unknown_request() {
+    let resolver: Arc<dyn a4mp::CredentialResolver> = Arc::new(Leases::disconnected());
+    let service = Service::new(
+        test_router(resolver, Arc::new(Mutex::new(Vec::new()))),
+        Meter::unmetered(),
+    );
+    let replies = run(
+        &service,
+        b"{\"id\":1,\"method\":\"chat.cancel\",\"params\":{\"requestId\":42}}\n",
+    )
+    .await;
+    assert_eq!(replies[0]["error"], "unknown in-flight request");
+}
+
+#[tokio::test]
+async fn a_failed_meter_never_fails_the_stream() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let resolver = resolver_with_lease();
+    // A binding whose grants exclude the forwarded scope: settlement is
+    // refused on every reply, and the stream must be unaffected.
+    let binding = token_usage_detector::SourceBinding::new(
+        "source:test#1",
+        "test.ext",
+        "inst",
+        1,
+        "epoch-A",
+        ["some:other-scope"],
+    )
+    .expect("binding");
+    let meter = Meter::compose(dir.path(), binding).expect("meter");
+    let adapter = stream_adapter(
+        Arc::clone(&resolver),
+        Arc::new(Mutex::new(Vec::new())),
+        scripted_events(),
+        false,
+    );
+    let service = Service::new(test_router_with(resolver, adapter), meter);
+
+    let replies = run(
+        &service,
+        &request_line(1, "chat.stream", chat_params(stream_body(), None)),
+    )
+    .await;
+    let end = replies
+        .iter()
+        .find(|r| r["id"] == 1 && r["stream"] == "end")
+        .expect("stream end line");
+    assert_eq!(end["status"], "done");
+    assert!(service.meter().failure_count() >= 1);
+    assert!(service.meter().facts().is_empty());
 }

@@ -467,38 +467,23 @@ fn gateway_binding(instance: &str, source_epoch: &str) -> Result<SourceBinding> 
     .map_err(|failure| Error::Meter(format!("source binding: {}", failure.code)))
 }
 
-/// The canonical-counter spelling one usage projection carries: the
-/// caller-facing reply spells them camelCase; the settlement record
-/// feeds the detector's snake_case aliases.
-#[derive(Clone, Copy)]
-pub(crate) enum UsageKeyStyle {
-    /// `inputTokens` / `outputTokens` — the `chat.complete` reply shape.
-    Reply,
-    /// `input_tokens` / `output_tokens` — the settlement record shape.
-    Record,
-}
-
-/// The usage object one projection emits, in either spelling: the
-/// canonical counters plus every provider-native field, verbatim — one
-/// guard shared by both projections: an extension must not overwrite a
+/// The usage object the settlement record emits: the canonical counters
+/// in the detector's snake_case spelling plus every provider-native
+/// field, verbatim — one guard: an extension must not overwrite a
 /// canonical counter the provider actually counted, while an extension
 /// naming an absent counter still forwards under its own spelling —
 /// nothing is overwritten either way.
-pub(crate) fn usage_object(usage: &a4mp::Usage, style: UsageKeyStyle) -> Map<String, Value> {
-    let (input_key, output_key) = match style {
-        UsageKeyStyle::Reply => ("inputTokens", "outputTokens"),
-        UsageKeyStyle::Record => ("input_tokens", "output_tokens"),
-    };
+pub(crate) fn usage_object(usage: &a4mp::Usage) -> Map<String, Value> {
     let mut object = Map::new();
     if let Some(input) = usage.input_tokens {
-        object.insert(input_key.to_owned(), input.into());
+        object.insert("input_tokens".to_owned(), input.into());
     }
     if let Some(output) = usage.output_tokens {
-        object.insert(output_key.to_owned(), output.into());
+        object.insert("output_tokens".to_owned(), output.into());
     }
     for (key, value) in &usage.extensions {
-        let overwrites = (usage.input_tokens.is_some() && key == input_key)
-            || (usage.output_tokens.is_some() && key == output_key);
+        let overwrites = (usage.input_tokens.is_some() && key == "input_tokens")
+            || (usage.output_tokens.is_some() && key == "output_tokens");
         if overwrites {
             continue;
         }
@@ -510,7 +495,7 @@ pub(crate) fn usage_object(usage: &a4mp::Usage, style: UsageKeyStyle) -> Map<Str
 /// The provider usage record the settlement hook feeds the mapping — the
 /// mapping owns alias folding, so nothing is flattened here first.
 fn usage_record(usage: &a4mp::Usage) -> Value {
-    json!({ "usage": usage_object(usage, UsageKeyStyle::Record) })
+    json!({ "usage": usage_object(usage) })
 }
 
 /// The `namespace/path` metrics for the record's named-but-uncounted

@@ -5,10 +5,12 @@
 //! line. The process composes, it does not listen — the host owns the
 //! sockets, the custody, and the epoch file it rotates to revoke.
 //!
-//! The routes document is `{"upstreamDeadlineSecs"?: 600,
+//! The routes document is `{"upstreamDeadlineSecs"?,
 //! "routes":[{model,provider,upstreamModel?,protocol?,region?,auth?,vars?}]}` —
-//! the deadline bounds one upstream call (`0` waits unbounded), and a
-//! malformed entry refuses startup rather than running half a table.
+//! the deadline bounds one upstream call when the host sets it (`0` or
+//! absent waits unbounded — the caller cancels; the sidecar never
+//! self-times-out viable work), and a malformed entry refuses startup
+//! rather than running half a table.
 
 use std::path::PathBuf;
 use std::process::exit;
@@ -17,10 +19,12 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use fairliny_gateway::leases::{FileEpochSource, Leases};
+#[cfg(unix)]
+use fairliny_gateway::leases::FileEpochSource;
+use fairliny_gateway::leases::Leases;
 use fairliny_gateway::meter::Meter;
 use fairliny_gateway::router::Router;
-use fairliny_gateway::service::{DEFAULT_UPSTREAM_DEADLINE, Service};
+use fairliny_gateway::service::Service;
 use fairliny_gateway::{Error, Result};
 
 /// The default data home when `--state-root` and `FAIRLINY_STATE_ROOT`
@@ -51,13 +55,13 @@ fn usage() -> ! {
     exit(2)
 }
 
-/// The upstream-deadline knob the routes document carries:
-/// `upstreamDeadlineSecs` bounds one provider call so a hung upstream
-/// cannot stall the whole gateway — `0` opts back into an unbounded
-/// wait. Absent means [`DEFAULT_UPSTREAM_DEADLINE`].
+/// The upstream-deadline knob the routes document carries: absent or `0`
+/// waits unbounded — a viable call ends by caller cancel or provider
+/// answer. A positive value is the host's explicit bound on one upstream
+/// call, so a hung upstream cannot stall the whole gateway.
 fn upstream_deadline(config: &Value) -> Result<Option<Duration>> {
     match config.get("upstreamDeadlineSecs") {
-        None => Ok(Some(DEFAULT_UPSTREAM_DEADLINE)),
+        None => Ok(None),
         Some(value) => {
             let seconds = value.as_u64().ok_or_else(|| {
                 Error::Request("upstreamDeadlineSecs requires a non-negative integer".to_owned())
@@ -109,7 +113,7 @@ fn install_handoff_if_offered(leases: &Leases) -> Result<()> {
     }
     #[cfg(not(unix))]
     {
-        let _ = fd;
+        let _ = (fd, leases);
         Err(Error::Credential(
             "inherited-fd handoff requires a unix host".to_owned(),
         ))
@@ -171,6 +175,46 @@ async fn main() {
     if let Err(error) = result {
         eprintln!("error: {error}");
         exit(1);
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[test]
+    fn an_absent_deadline_waits_unbounded() {
+        assert_eq!(
+            upstream_deadline(&serde_json::json!({})).expect("deadline"),
+            None
+        );
+        assert_eq!(
+            upstream_deadline(&serde_json::Value::Null).expect("deadline"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_zero_deadline_waits_unbounded() {
+        assert_eq!(
+            upstream_deadline(&serde_json::json!({"upstreamDeadlineSecs": 0})).expect("deadline"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_positive_deadline_is_the_hosts_bound() {
+        assert_eq!(
+            upstream_deadline(&serde_json::json!({"upstreamDeadlineSecs": 60})).expect("deadline"),
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    #[test]
+    fn a_non_integer_deadline_is_refused() {
+        assert!(upstream_deadline(&serde_json::json!({"upstreamDeadlineSecs": "60"})).is_err());
+        assert!(upstream_deadline(&serde_json::json!({"upstreamDeadlineSecs": -1})).is_err());
+        assert!(upstream_deadline(&serde_json::json!({"upstreamDeadlineSecs": 1.5})).is_err());
     }
 }
 

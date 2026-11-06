@@ -37,7 +37,7 @@ hook — never inside it.
 | `leases` | The credential custody port: the `ProviderCredential` kind family, the process-bound `CredentialSlot`, `FileEpochSource` for custody-driven revocation, and a4mp's `CredentialResolver`. |
 | `meter` | Metera composed in: bounded per-day agent×model request counters (`GatewayUsageRecorder`-shaped), and response settlement — `ProviderMapping` → `SourceBinding` → `UsageSourcePort` — into the usage journal. |
 | `export` | Prometheus/OpenMetrics text from `agent-statistics::export` for a host-mounted scrape route. |
-| `service` | The `fairliny serve` sidecar: one JSON request per stdin line, methods `models.list`, `chat.complete`, `metrics.exposition`. |
+| `service` | The `fairliny serve` sidecar: one JSON request per stdin line, methods `models.list`, `chat.complete`, `chat.stream`, `chat.cancel`, `metrics.exposition`. |
 
 ## `fairliny serve`
 
@@ -48,6 +48,17 @@ fairliny serve [--config routes.json] [--state-root DIR]
 Requests are one JSON object per line: `{"id":N,"method":...,"params":{}}`.
 Replies are `{"id":N,"result":{...}}` or `{"id":N,"error":"..."}`; a
 malformed line answers `id: null` and the loop continues.
+
+`chat.complete`/`chat.stream` params are `{dialect, body, agent?}` over
+three wire dialects (`openai-chat-completions`, `openai-responses`,
+`anthropic-messages`) — the body's `model` is the outward name.
+`chat.complete` answers `{body, losses}`; `chat.stream` relays dialect
+SSE frames as `stream:"data"` lines then one `stream:"end"` line.
+`chat.cancel` cancels an in-flight request by its `requestId`. Chat
+requests run on their own tasks, so replies and frames for different
+requests may interleave — correlate by `id`. `upstreamDeadlineSecs`
+absent or `0` waits unbounded — the caller cancels; a positive value
+bounds one upstream call.
 
 - `--config` / `FAIRLINY_CONFIG` — routes document:
   `{"routes":[{"model":"chat","provider":"openai","upstreamModel":"gpt-4o-mini","protocol":"openai-chat-completions","auth":"api-key"}]}`
