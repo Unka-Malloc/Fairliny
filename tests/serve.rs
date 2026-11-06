@@ -1237,3 +1237,128 @@ async fn a_failed_meter_never_fails_the_stream() {
     assert!(service.meter().failure_count() >= 1);
     assert!(service.meter().facts().is_empty());
 }
+
+/// Each `chat` call announces itself, then: the first call waits for its
+/// cancel and then for `release_first` before it answers — the late
+/// finish of a cancelled request; the second waits for its cancel; every
+/// later call answers at once.
+struct GatedAdapter {
+    target: a4mp::ServiceTarget,
+    calls: std::sync::atomic::AtomicUsize,
+    entered: tokio::sync::mpsc::UnboundedSender<usize>,
+    release_first: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl a4mp::Adapter for GatedAdapter {
+    fn target(&self) -> &a4mp::ServiceTarget {
+        &self.target
+    }
+
+    async fn chat(
+        &self,
+        _request: a4mp::ChatRequest,
+        control: &a4mp::RequestControl,
+    ) -> std::result::Result<a4mp::Output, a4mp::Error> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.entered.send(call).expect("test observer");
+        if call >= 2 {
+            return Ok(reply_output());
+        }
+        control.cancel.cancelled().await;
+        if call == 0 {
+            self.release_first.notified().await;
+        }
+        Err(a4mp::Error::Cancelled)
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_request_finishing_late_never_releases_a_reused_id() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let release_first = Arc::new(tokio::sync::Notify::new());
+    let adapter = Arc::new(GatedAdapter {
+        target: stub_target(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        entered,
+        release_first: Arc::clone(&release_first),
+    });
+    let resolver: Arc<dyn a4mp::CredentialResolver> = Arc::new(Leases::disconnected());
+    let service = Service::new(test_router_with(resolver, adapter), Meter::unmetered());
+
+    let (mut client, server_in) = tokio::io::duplex(64 * 1024);
+    let (server_out, client_out) = tokio::io::duplex(64 * 1024);
+    let mut replies = tokio::io::BufReader::new(client_out).lines();
+    let body =
+        serde_json::json!({"model": "ping-model", "messages": [{"role": "user", "content": "hi"}]});
+    let complete = request_line(1, "chat.complete", chat_params(body, None));
+    let cancel = |id: i64| request_line(id, "chat.cancel", serde_json::json!({"requestId": 1}));
+
+    let driver = async {
+        let mut next = async || -> serde_json::Value {
+            let line = replies
+                .next_line()
+                .await
+                .expect("read")
+                .expect("reply line");
+            serde_json::from_str(&line).expect("reply json")
+        };
+        // Request A claims id 1 and is cancelled; its adapter holds the
+        // late finish back.
+        client.write_all(&complete).await.expect("write");
+        assert_eq!(entered_rx.recv().await, Some(0));
+        client.write_all(&cancel(2)).await.expect("write");
+        let reply = next().await;
+        assert_eq!(reply["id"], 2);
+        assert_eq!(reply["result"]["cancelled"], true);
+
+        // Request B reuses id 1 while A is still running.
+        client.write_all(&complete).await.expect("write");
+        assert_eq!(entered_rx.recv().await, Some(1));
+
+        // A finishes late; its claim is released before its reply.
+        release_first.notify_one();
+        let reply = next().await;
+        assert_eq!(reply["id"], 1);
+        assert!(
+            reply["error"]
+                .as_str()
+                .expect("error")
+                .contains("cancelled"),
+            "{reply}"
+        );
+
+        // B still owns id 1: a third claim is refused ...
+        client.write_all(&complete).await.expect("write");
+        assert_eq!(next().await["error"], "request id in-flight");
+
+        // ... and B is still cancellable, and completes.
+        client.write_all(&cancel(3)).await.expect("write");
+        let pair = [next().await, next().await];
+        let cancelled = pair.iter().find(|r| r["id"] == 3).expect("cancel reply");
+        assert_eq!(cancelled["result"]["cancelled"], true);
+        let finished = pair.iter().find(|r| r["id"] == 1).expect("B reply");
+        assert!(
+            finished["error"]
+                .as_str()
+                .expect("error")
+                .contains("cancelled"),
+            "{finished}"
+        );
+
+        // With B finished, id 1 is free again and a new request completes.
+        client.write_all(&complete).await.expect("write");
+        assert_eq!(entered_rx.recv().await, Some(2));
+        let reply = next().await;
+        assert_eq!(reply["id"], 1);
+        assert!(reply["result"]["body"].is_object(), "{reply}");
+        drop(client);
+    };
+    let (served, ()) = tokio::join!(
+        service.serve(tokio::io::BufReader::new(server_in), server_out),
+        driver
+    );
+    served.expect("serve loop");
+}
