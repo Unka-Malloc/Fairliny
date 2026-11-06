@@ -25,8 +25,8 @@ resolver = "3"
 a4mp = { path = "../Adapters-For-Model-Providers", version = "0.4.0" }
 credential-lease = { path = "../Credential-Lease/crates/credential-lease", version = "0.3.0" }
 agent-statistics = { path = "../Metera/crates/agent-statistics", version = "0.3.0" }
-token-usage-detector = { path = "../Metera/crates/token-usage-detector", version = "0.2.1" }
-collection-store = { path = "../Metera/crates/collection-store", version = "0.1.0" }
+token-usage-detector = { path = "../Metera/crates/token-usage-detector", version = "0.2.2" }
+collection-store = { path = "../Metera/crates/collection-store", version = "0.1.1" }
 anyhow = "1"
 async-trait = "0.1"
 futures-core = "0.3"
