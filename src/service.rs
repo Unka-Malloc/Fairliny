@@ -26,7 +26,8 @@
 //! the caller cancels.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use futures_core::Stream;
@@ -98,6 +99,71 @@ async fn read_capped_line(
     }
 }
 
+/// Take a service lock whether or not it is poisoned. Every structure
+/// these locks guard — the task sets and the in-flight table — changes
+/// only through single, non-panicking operations, so the data a poisoned
+/// lock guards is still consistent: recovering it keeps work tracked
+/// instead of silently dropping a request.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// In-flight request id → the claim that owns it, for `chat.cancel`.
+/// Each claim carries a fresh generation: once `chat.cancel` frees an id,
+/// a newer request may claim it, and the older task's release must leave
+/// that newer entry alone.
+#[derive(Default)]
+struct InFlight {
+    next_generation: AtomicU64,
+    table: Mutex<BTreeMap<String, (u64, a4mp::RequestControl)>>,
+}
+
+impl InFlight {
+    /// Claim `key` for the life of one forward. A duplicate id is
+    /// refused: two requests cannot share one correlation key.
+    fn claim(self: &Arc<Self>, key: String, control: &a4mp::RequestControl) -> Option<Claim> {
+        let mut table = lock(&self.table);
+        if table.contains_key(&key) {
+            return None;
+        }
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        table.insert(key.clone(), (generation, control.clone()));
+        Some(Claim {
+            owner: Arc::clone(self),
+            key,
+            generation,
+        })
+    }
+
+    /// Remove `key`'s entry for `chat.cancel`, handing back its control.
+    fn take(&self, key: &str) -> Option<a4mp::RequestControl> {
+        lock(&self.table).remove(key).map(|(_, control)| control)
+    }
+}
+
+/// One forward's ownership of its request id. Dropping it releases the
+/// entry only while the entry is still this claim's own generation — a
+/// cancelled request finishing late never touches the request that
+/// reused its id. The forward drops it before writing its final reply,
+/// so a caller that saw the reply may reuse the id at once.
+struct Claim {
+    owner: Arc<InFlight>,
+    key: String,
+    generation: u64,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        let mut table = lock(&self.owner.table);
+        if table
+            .get(&self.key)
+            .is_some_and(|(generation, _)| *generation == self.generation)
+        {
+            table.remove(&self.key);
+        }
+    }
+}
+
 /// The composed gateway: router and meter behind one dispatch surface.
 pub struct Service {
     router: Router,
@@ -109,8 +175,8 @@ pub struct Service {
     /// Settlement tasks — the same fault-isolated set as before, shared
     /// with the forward tasks that spawn into it.
     settle: Arc<Mutex<JoinSet<()>>>,
-    /// In-flight request id → its control handle, for `chat.cancel`.
-    inflight: Arc<Mutex<BTreeMap<String, a4mp::RequestControl>>>,
+    /// In-flight request claims, for `chat.cancel`.
+    inflight: Arc<InFlight>,
     /// Spawned chat tasks, reaped like the settlement set.
     forward: Mutex<JoinSet<()>>,
 }
@@ -123,7 +189,7 @@ impl Service {
             meter: Arc::new(meter),
             upstream_deadline: None,
             settle: Arc::new(Mutex::new(JoinSet::new())),
-            inflight: Arc::new(Mutex::new(BTreeMap::new())),
+            inflight: Arc::new(InFlight::default()),
             forward: Mutex::new(JoinSet::new()),
         }
     }
@@ -150,7 +216,7 @@ impl Service {
     /// next dispatch has not reaped yet. The observable bound on the
     /// task set.
     pub fn settle_len(&self) -> usize {
-        self.settle.lock().map(|tasks| tasks.len()).unwrap_or(0)
+        lock(&self.settle).len()
     }
 
     /// Reap settlement tasks that already finished: the tracked set
@@ -158,10 +224,7 @@ impl Service {
     /// one entry per forwarded request for the process lifetime. A
     /// panicked settlement counts as a metering failure like any other.
     fn reap_settlements(&self) {
-        let Ok(mut tasks) = self.settle.lock() else {
-            self.meter.count_failure();
-            return;
-        };
+        let mut tasks = lock(&self.settle);
         while let Some(result) = tasks.try_join_next() {
             if result.is_err() {
                 self.meter.count_failure();
@@ -172,21 +235,8 @@ impl Service {
     /// Reap forward tasks that already finished — the same bound
     /// `reap_settlements` keeps on the settlement set.
     fn reap_forward(&self) {
-        if let Ok(mut tasks) = self.forward.lock() {
-            while tasks.try_join_next().is_some() {}
-        }
-    }
-
-    /// Claim a request id for the life of one forward. A duplicate id is
-    /// refused: two requests cannot share one correlation key.
-    fn register(&self, key: &str, control: &a4mp::RequestControl) -> bool {
-        match self.inflight.lock() {
-            Ok(mut table) if !table.contains_key(key) => {
-                table.insert(key.to_owned(), control.clone());
-                true
-            }
-            _ => false,
-        }
+        let mut tasks = lock(&self.forward);
+        while tasks.try_join_next().is_some() {}
     }
 
     /// Parse `{dialect, body, agent?}` into the canonical request, resolve
@@ -239,12 +289,7 @@ impl Service {
         let target = params
             .get("requestId")
             .ok_or_else(|| Error::Request("chat.cancel params require requestId".to_owned()))?;
-        let key = id_key(target);
-        let control = match self.inflight.lock() {
-            Ok(mut table) => table.remove(&key),
-            Err(_) => return Err(Error::Request("in-flight table poisoned".to_owned())),
-        };
-        match control {
+        match self.inflight.take(&id_key(target)) {
             Some(control) => {
                 control.cancel.cancel();
                 Ok(json!({ "cancelled": true }))
@@ -284,15 +329,12 @@ impl Service {
             Ok(prepared) => prepared,
             Err(error) => return error_reply(id, &error.to_string()),
         };
-        let key = id_key(&id);
-        if !self.register(&key, &prepared.control) {
+        let Some(claim) = self.inflight.claim(id_key(&id), &prepared.control) else {
             return error_reply(id, "request id in-flight");
-        }
+        };
         let result =
             buffered_result(&self.meter, &self.settle, self.upstream_deadline, prepared).await;
-        if let Ok(mut table) = self.inflight.lock() {
-            table.remove(&key);
-        }
+        drop(claim);
         reply(id, result)
     }
 
@@ -356,43 +398,35 @@ impl Service {
                             continue;
                         }
                     };
-                    let key = id_key(&id);
-                    if !self.register(&key, &prepared.control) {
+                    let Some(claim) = self.inflight.claim(id_key(&id), &prepared.control) else {
                         write_line(&writer, &error_reply(id, "request id in-flight")).await?;
                         continue;
-                    }
+                    };
                     self.reap_forward();
                     let meter = Arc::clone(&self.meter);
                     let settle = Arc::clone(&self.settle);
-                    let inflight = Arc::clone(&self.inflight);
                     let deadline = self.upstream_deadline;
                     let task_writer = Arc::clone(&writer);
-                    match method {
-                        Some("chat.complete") => {
-                            let task = async move {
-                                let result =
-                                    buffered_result(&meter, &settle, deadline, prepared).await;
-                                let _ = write_line(&task_writer, &reply(id, result)).await;
-                                if let Ok(mut table) = inflight.lock() {
-                                    table.remove(&key);
-                                }
-                            };
-                            if let Ok(mut tasks) = self.forward.lock() {
-                                tasks.spawn(task);
-                            }
-                        }
-                        _ => {
-                            let task = async move {
-                                run_stream(&task_writer, &meter, &settle, deadline, id, prepared)
-                                    .await;
-                                if let Ok(mut table) = inflight.lock() {
-                                    table.remove(&key);
-                                }
-                            };
-                            if let Ok(mut tasks) = self.forward.lock() {
-                                tasks.spawn(task);
-                            }
-                        }
+                    let mut tasks = lock(&self.forward);
+                    if method == Some("chat.complete") {
+                        tasks.spawn(async move {
+                            let result = buffered_result(&meter, &settle, deadline, prepared).await;
+                            drop(claim);
+                            let _ = write_line(&task_writer, &reply(id, result)).await;
+                        });
+                    } else {
+                        tasks.spawn(async move {
+                            run_stream(
+                                &task_writer,
+                                &meter,
+                                &settle,
+                                deadline,
+                                id,
+                                prepared,
+                                claim,
+                            )
+                            .await;
+                        });
                     }
                 }
                 other => {
@@ -403,11 +437,7 @@ impl Service {
         }
         // In-flight work runs to completion — its replies still belong on
         // the wire.
-        let mut drained = self
-            .forward
-            .lock()
-            .map(|mut tasks| std::mem::replace(&mut *tasks, JoinSet::new()))
-            .unwrap_or_default();
+        let mut drained = std::mem::take(&mut *lock(&self.forward));
         while drained.join_next().await.is_some() {}
         Ok(())
     }
@@ -417,20 +447,10 @@ impl Service {
     /// the exposition before it answers) observes a settled journal
     /// instead of racing it.
     pub async fn flush_metering(&self) {
-        let drained = match self.settle.lock() {
-            Ok(mut guard) => Some(std::mem::replace(&mut *guard, JoinSet::new())),
-            Err(_) => {
-                // A poisoned task set is a metering failure like any
-                // other — counted, never propagated.
+        let mut tasks = std::mem::take(&mut *lock(&self.settle));
+        while let Some(result) = tasks.join_next().await {
+            if result.is_err() {
                 self.meter.count_failure();
-                None
-            }
-        };
-        if let Some(mut tasks) = drained {
-            while let Some(result) = tasks.join_next().await {
-                if result.is_err() {
-                    self.meter.count_failure();
-                }
             }
         }
         self.meter.flush();
@@ -549,9 +569,7 @@ fn end_line(
 }
 
 /// Settlement is ordered after the response exists and runs on its own
-/// task: the reply never waits on the journal. A lock that cannot be
-/// taken is a metering failure like any other — counted, never
-/// propagated.
+/// task: the reply never waits on the journal.
 fn spawn_settle(
     meter: &Arc<Meter>,
     settle: &Mutex<JoinSet<()>>,
@@ -559,13 +577,9 @@ fn spawn_settle(
     usage: Option<a4mp::Usage>,
 ) {
     let meter = Arc::clone(meter);
-    if let Ok(mut tasks) = settle.lock() {
-        tasks.spawn(async move {
-            meter.settle_response(&provider, usage.as_ref()).await;
-        });
-    } else {
-        meter.count_failure();
-    }
+    lock(settle).spawn(async move {
+        meter.settle_response(&provider, usage.as_ref()).await;
+    });
 }
 
 /// What `chat.complete`/`chat.stream` need after the line is read:
@@ -690,7 +704,8 @@ async fn pump_frames(
 /// The streaming forward: frames relayed live, then exactly one
 /// `stream:"end"` line — or the ordinary error reply when nothing ever
 /// framed. The last usage event settles once, on success, failure or
-/// cancel alike.
+/// cancel alike, and the request's claim is released before the
+/// terminal line is written.
 async fn run_stream(
     writer: &SharedWriter,
     meter: &Arc<Meter>,
@@ -698,6 +713,7 @@ async fn run_stream(
     deadline: Option<Duration>,
     id: Value,
     mut prepared: PreparedChat,
+    claim: Claim,
 ) {
     let provider = prepared.bound.provider.as_str().to_owned();
     let mut state = PumpState {
@@ -713,18 +729,15 @@ async fn run_stream(
         None => pump.await,
     };
     spawn_settle(meter, settle, provider, state.last_usage);
-    match outcome {
-        PumpOutcome::Done => {
-            let _ = write_line(writer, &end_line(&id, "done", &state.losses, None)).await;
-        }
+    let line = match outcome {
+        PumpOutcome::Done => Some(end_line(&id, "done", &state.losses, None)),
         PumpOutcome::Deadline => {
             let error = Error::UpstreamDeadline(deadline.unwrap_or_default()).to_string();
-            let line = if state.wrote_frame {
+            Some(if state.wrote_frame {
                 end_line(&id, "error", &state.losses, Some(&error))
             } else {
                 error_reply(id, &error)
-            };
-            let _ = write_line(writer, &line).await;
+            })
         }
         PumpOutcome::Ended(error) => {
             // Adapter failures surface through the same `adapter:`
@@ -732,14 +745,17 @@ async fn run_stream(
             // the wire, whether the call framed or not.
             let status = matches!(error, a4mp::Error::Cancelled);
             let message = Error::Adapter(error).to_string();
-            let line = match (state.wrote_frame, status) {
+            Some(match (state.wrote_frame, status) {
                 (true, true) => end_line(&id, "cancelled", &state.losses, Some(&message)),
                 (true, false) => end_line(&id, "error", &state.losses, Some(&message)),
                 (false, _) => error_reply(id, &message),
-            };
-            let _ = write_line(writer, &line).await;
+            })
         }
-        PumpOutcome::WriteFailed => {}
+        PumpOutcome::WriteFailed => None,
+    };
+    drop(claim);
+    if let Some(line) = line {
+        let _ = write_line(writer, &line).await;
     }
 }
 
@@ -812,5 +828,91 @@ mod tests {
             read_capped_line(&mut input, &mut line).await.expect("read"),
             InputLine::Eof
         ));
+    }
+
+    /// Answers every chat with an empty output — enough to forward.
+    struct EchoAdapter {
+        target: a4mp::ServiceTarget,
+    }
+
+    #[async_trait::async_trait]
+    impl a4mp::Adapter for EchoAdapter {
+        fn target(&self) -> &a4mp::ServiceTarget {
+            &self.target
+        }
+
+        async fn chat(
+            &self,
+            _request: a4mp::ChatRequest,
+            _control: &a4mp::RequestControl,
+        ) -> std::result::Result<a4mp::Output, a4mp::Error> {
+            Ok(a4mp::Output::default())
+        }
+    }
+
+    fn poison<T>(mutex: &Mutex<T>) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = mutex.lock();
+            panic!("poison the lock under test");
+        }));
+        assert!(mutex.is_poisoned());
+    }
+
+    #[tokio::test]
+    async fn poisoned_locks_never_drop_a_request() {
+        let resolver: Arc<dyn a4mp::CredentialResolver> =
+            Arc::new(crate::leases::Leases::disconnected());
+        let mut router = Router::new(Arc::new(a4mp::ReqwestTransport::new()), resolver);
+        router.register_adapter(
+            "ping-model",
+            "upstream-ping",
+            Arc::new(EchoAdapter {
+                target: a4mp::ServiceTarget::new(
+                    "stub",
+                    a4mp::Protocol::Other("stub".to_owned()),
+                    url::Url::parse("https://stub.invalid/").expect("url"),
+                ),
+            }),
+        );
+        let service = Service::new(router, Meter::unmetered());
+        poison(&service.forward);
+        poison(&service.settle);
+        poison(&service.inflight.table);
+
+        let request = |id: u64| {
+            json!({"id": id, "method": "chat.complete", "params": {
+                "dialect": "openai-chat-completions",
+                "body": {"model": "ping-model", "messages": [{"role": "user", "content": "hi"}]},
+            }})
+            .to_string()
+        };
+        let input = format!("{}\n{}\n", request(1), request(2));
+        let (writer, mut reader) = tokio::io::duplex(64 * 1024);
+        let collected = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            reader.read_to_end(&mut buf).await.expect("read replies");
+            buf
+        });
+        service
+            .serve(input.as_bytes(), writer)
+            .await
+            .expect("serve loop");
+        service.flush_metering().await;
+        let output = String::from_utf8(collected.await.expect("reader")).expect("utf8");
+        let replies: Vec<Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("reply json"))
+            .collect();
+
+        // Both forwards ran and answered through the poisoned task set;
+        // their claims were released through the poisoned table, and the
+        // settlement set drained to empty.
+        assert_eq!(replies.len(), 2, "{replies:?}");
+        for id in [1, 2] {
+            let reply = replies.iter().find(|r| r["id"] == id).expect("reply");
+            assert!(reply["result"]["body"].is_object(), "{reply}");
+        }
+        assert!(lock(&service.inflight.table).is_empty());
+        assert_eq!(service.settle_len(), 0);
     }
 }
