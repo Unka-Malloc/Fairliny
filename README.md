@@ -63,8 +63,10 @@ bounds one upstream call.
 - `--config` / `FAIRLINY_CONFIG` — routes document:
   `{"routes":[{"model":"chat","provider":"openai","upstreamModel":"gpt-4o-mini","protocol":"openai-chat-completions","auth":"api-key"}]}`
 - `--state-root` / `FAIRLINY_STATE_ROOT` — the metering data home
-  (default `~/.fairliny`); `--no-meter` keeps counters in memory and
-  skips the journal.
+  (default `~/.fairliny`, else `fairliny` under `XDG_STATE_HOME` or
+  `LOCALAPPDATA`; never the working directory — with no absolute base
+  the process refuses to start metered); `--no-meter` keeps counters in
+  memory and skips the journal.
 - `FAIRLINY_HANDOFF_FD` — an inherited file descriptor carrying the
   `CredentialHandoff` document (unix). `FAIRLINY_EPOCH_FILE` names the
   file the custody owner rewrites on epoch rotation; without it the

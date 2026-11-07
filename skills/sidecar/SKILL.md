@@ -44,7 +44,9 @@ JSON reply per stdout line.
 - Configuration lands by launch flags or environment: `--config` /
   `FAIRLINY_CONFIG` for the routes document, `--state-root` /
   `FAIRLINY_STATE_ROOT` for the metering data home (default
-  `~/.fairliny`), `--no-meter` for in-memory counters with no journal.
+  `~/.fairliny`, else `fairliny` under `XDG_STATE_HOME` or
+  `LOCALAPPDATA`, never the working directory), `--no-meter` for
+  in-memory counters with no journal.
 - Credentials arrive through `FAIRLINY_HANDOFF_FD` — an inherited file
   descriptor carrying the `CredentialHandoff` document.
   `FAIRLINY_EPOCH_FILE` names the file the custody owner rewrites on
