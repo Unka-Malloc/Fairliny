@@ -5,6 +5,8 @@ version = 4
 [[package]]
 name = "a4mp"
 version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1549dc158c4e607969003ffbb7d360899f36334142c551ae0cf4bb7fdddbb05b"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -44,12 +46,15 @@ dependencies = [
 [[package]]
 name = "acop"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3849fd57c7091a8698a3b88792b68c977f125ad90a4b14fbded03044424127b2"
 dependencies = [
  "acop-usage-core",
  "regex",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "uuid",
 ]
@@ -57,6 +62,8 @@ dependencies = [
 [[package]]
 name = "acop-usage-core"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae999cac1f9bde9678fb5d66c15a6281333af9ce090048258c66462d53a861fa"
 dependencies = [
  "serde",
  "serde_json",
@@ -66,6 +73,8 @@ dependencies = [
 [[package]]
 name = "acop-usage-source"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88dc00c4049b773c52cf4ed4a8644f30a87a8e9d81b964867c404e114b9cde6a"
 dependencies = [
  "acop",
  "metera-sdk",
@@ -82,6 +91,8 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "agent-statistics"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fd629c7f6f409357b7385c3059aede6310d5663125c0ab80451bfd03960b597"
 dependencies = [
  "acativa",
  "acop",
@@ -203,6 +214,8 @@ dependencies = [
 [[package]]
 name = "collection-store"
 version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5649738db0d2b36830fb96e5f9b68ddcb718be2205f0cd93d6a47b4375a2e8eb"
 dependencies = [
  "anyhow",
  "libc",
@@ -240,6 +253,8 @@ dependencies = [
 [[package]]
 name = "credential-lease"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4b096520ec5fcf9adc7321bef5f613b409812c75f32dbcaaaf4f13ead448b6e"
 dependencies = [
  "anyhow",
  "serde",
@@ -826,6 +841,8 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "metera-sdk"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a00d23fd1baa040055c2aeb4578e8aa11d646f8a978cbd29ea4dccc2ac3ce342"
 dependencies = [
  "acop-usage-core",
  "serde",
@@ -1512,6 +1529,8 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 [[package]]
 name = "token-usage-detector"
 version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8639549e4584348c6570e2cb71c610f4537f39cc41c39227cd4c9963c89ea39d"
 dependencies = [
  "serde",
  "serde_json",

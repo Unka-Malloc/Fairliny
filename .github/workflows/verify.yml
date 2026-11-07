@@ -14,32 +14,9 @@ jobs:
     permissions:
       contents: read
     steps:
-      # Cargo path dependencies land side by side: a4mp, credential-lease and
-      # the Metera crates — whose acop workspace deps resolve through one
-      # more sibling.
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           path: Fairliny-Gateway
-          persist-credentials: false
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          repository: Unka-Malloc/Adapters-For-Model-Providers
-          path: Adapters-For-Model-Providers
-          persist-credentials: false
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          repository: Unka-Malloc/Credential-Lease
-          path: Credential-Lease
-          persist-credentials: false
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          repository: Unka-Malloc/Metera
-          path: Metera
-          persist-credentials: false
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          repository: Unka-Malloc/Agent-Context-Operators
-          path: ACOP
           persist-credentials: false
       - name: Rust toolchain
         run: rustup component add rustfmt clippy
