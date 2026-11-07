@@ -28,12 +28,40 @@ use fairliny_gateway::service::Service;
 use fairliny_gateway::{Error, Result};
 
 /// The default data home when `--state-root` and `FAIRLINY_STATE_ROOT`
-/// both stay silent.
-fn default_state_root() -> PathBuf {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map(|home| PathBuf::from(home).join(".fairliny"))
-        .unwrap_or_else(|_| PathBuf::from(".fairliny"))
+/// both stay silent: `~/.fairliny` under the home directory, else
+/// `fairliny` under the platform state directory (`XDG_STATE_HOME`,
+/// `LOCALAPPDATA`). Only absolute bases count, so metering data never
+/// lands in the working directory — `None` when no base resolves.
+fn default_state_root(var: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    let absolute = |name: &str| {
+        var(name)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    };
+    absolute("HOME")
+        .or_else(|| absolute("USERPROFILE"))
+        .map(|home| home.join(".fairliny"))
+        .or_else(|| {
+            absolute("XDG_STATE_HOME")
+                .or_else(|| absolute("LOCALAPPDATA"))
+                .map(|state| state.join("fairliny"))
+        })
+}
+
+/// The metering data home: the explicit flag or variable, else the
+/// default; refused when nothing resolves outside the working directory.
+fn state_root(args: &[String]) -> Result<PathBuf> {
+    flag_value(args, "--state-root")
+        .or_else(|| std::env::var("FAIRLINY_STATE_ROOT").ok())
+        .map(PathBuf::from)
+        .or_else(|| default_state_root(|name| std::env::var(name).ok()))
+        .ok_or_else(|| {
+            Error::Request(
+                "no metering state root: set --state-root or FAIRLINY_STATE_ROOT, \
+                 or pass --no-meter"
+                    .to_owned(),
+            )
+        })
 }
 
 fn flag_value(args: &[String], name: &str) -> Option<String> {
@@ -48,7 +76,8 @@ fn usage() -> ! {
         "usage:\n  fairliny serve [--config FILE] [--state-root DIR] [--no-meter]\n\n\
          environment:\n  \
          FAIRLINY_CONFIG       routes document (same shape as --config)\n  \
-         FAIRLINY_STATE_ROOT   metering data home (default ~/.fairliny)\n  \
+         FAIRLINY_STATE_ROOT   metering data home (default ~/.fairliny, else\n                        \
+         fairliny under XDG_STATE_HOME or LOCALAPPDATA)\n  \
          FAIRLINY_HANDOFF_FD   inherited fd carrying the CredentialHandoff document\n  \
          FAIRLINY_EPOCH_FILE   file the custody owner rewrites to rotate the lease epoch"
     );
@@ -121,10 +150,6 @@ fn install_handoff_if_offered(leases: &Leases) -> Result<()> {
 }
 
 async fn serve(args: &[String]) -> Result<()> {
-    let state_root = flag_value(args, "--state-root")
-        .or_else(|| std::env::var("FAIRLINY_STATE_ROOT").ok())
-        .map(PathBuf::from)
-        .unwrap_or_else(default_state_root);
     let config_text = flag_value(args, "--config")
         .or_else(|| std::env::var("FAIRLINY_CONFIG").ok())
         .map(|path| {
@@ -148,7 +173,7 @@ async fn serve(args: &[String]) -> Result<()> {
     let meter = if args.iter().any(|arg| arg == "--no-meter") {
         Meter::unmetered()
     } else {
-        Meter::open(&state_root)?
+        Meter::open(&state_root(args)?)?
     };
     let service = Service::new(router, meter).with_upstream_deadline(deadline);
     // Tokio's stdin reads through its blocking pool, so an idle sidecar
@@ -215,6 +240,77 @@ mod deadline_tests {
         assert!(upstream_deadline(&serde_json::json!({"upstreamDeadlineSecs": "60"})).is_err());
         assert!(upstream_deadline(&serde_json::json!({"upstreamDeadlineSecs": -1})).is_err());
         assert!(upstream_deadline(&serde_json::json!({"upstreamDeadlineSecs": 1.5})).is_err());
+    }
+}
+
+#[cfg(test)]
+mod state_root_tests {
+    use super::*;
+
+    /// An absolute path in this platform's form.
+    fn absolute(name: &str) -> String {
+        std::env::temp_dir()
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn lookup(vars: &[(&str, String)]) -> impl Fn(&str) -> Option<String> {
+        let vars: Vec<(String, String)> = vars
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), value.clone()))
+            .collect();
+        move |name| {
+            vars.iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    #[test]
+    fn the_home_directory_is_the_default_base() {
+        let home = absolute("home");
+        assert_eq!(
+            default_state_root(lookup(&[("HOME", home.clone())])),
+            Some(PathBuf::from(home).join(".fairliny"))
+        );
+    }
+
+    #[test]
+    fn without_a_home_the_platform_state_dir_is_used() {
+        let state = absolute("state");
+        assert_eq!(
+            default_state_root(lookup(&[("XDG_STATE_HOME", state.clone())])),
+            Some(PathBuf::from(state).join("fairliny"))
+        );
+        let local = absolute("local");
+        assert_eq!(
+            default_state_root(lookup(&[("LOCALAPPDATA", local.clone())])),
+            Some(PathBuf::from(local).join("fairliny"))
+        );
+    }
+
+    #[test]
+    fn relative_or_missing_bases_never_resolve_into_the_working_directory() {
+        assert_eq!(default_state_root(lookup(&[])), None);
+        assert_eq!(
+            default_state_root(lookup(&[
+                ("HOME", String::new()),
+                ("USERPROFILE", ".".to_owned()),
+                ("XDG_STATE_HOME", "state".to_owned()),
+                ("LOCALAPPDATA", "local".to_owned()),
+            ])),
+            None
+        );
+        // A relative home is skipped in favour of an absolute state dir.
+        let state = absolute("state");
+        assert_eq!(
+            default_state_root(lookup(&[
+                ("HOME", ".".to_owned()),
+                ("XDG_STATE_HOME", state.clone())
+            ])),
+            Some(PathBuf::from(state).join("fairliny"))
+        );
     }
 }
 
