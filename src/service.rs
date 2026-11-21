@@ -36,7 +36,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWr
 use tokio::task::JoinSet;
 
 use crate::meter::Meter;
-use crate::router::{Access, BoundRoute, Router, auth_label, endpoint_authority, protocol_label};
+use crate::router::{BoundRoute, Router, auth_label, endpoint_authority, protocol_label};
 use crate::{Error, Result};
 
 /// Upper bound on one request line. A line past it is hostile input, not
@@ -463,30 +463,33 @@ impl Service {
         for (model, route) in self.router.routes() {
             let mut entry = json!({
                 "id": model,
+                "provider": route.provider.as_str(),
+                "protocol": route.protocol.as_ref().map(protocol_label),
                 "upstreamModel": route.upstream_model,
                 "auth": auth_label(&route.auth),
                 "bound": "route",
             });
-            match &route.access {
-                Access::Profile {
-                    provider, protocol, ..
-                } => {
-                    entry["provider"] = provider.as_str().into();
-                    entry["protocol"] = protocol.as_ref().map(protocol_label).into();
-                }
-                // The endpoint shows its authority only: the base URL
-                // carries no credentials and its path stays private.
-                Access::Endpoint {
-                    base_url,
-                    protocol,
-                    auth_header,
-                } => {
-                    entry["endpoint"] = endpoint_authority(base_url).into();
-                    entry["protocol"] = protocol_label(protocol).into();
-                    if let Some(header) = auth_header {
-                        entry["authHeader"] = header.as_str().into();
-                    }
-                }
+            if let Some(scope) = self.router.credential_scope(model) {
+                entry["credentialScope"] = scope.into();
+            }
+            models.push(entry);
+        }
+        for (model, route) in self.router.endpoint_routes() {
+            // The endpoint shows its authority only: the base URL
+            // carries no credentials and its path stays private.
+            let mut entry = json!({
+                "id": model,
+                "endpoint": endpoint_authority(&route.base_url),
+                "protocol": protocol_label(&route.protocol),
+                "upstreamModel": route.upstream_model,
+                "auth": auth_label(&route.auth),
+                "bound": "route",
+            });
+            if let Some(header) = &route.auth_header {
+                entry["authHeader"] = header.as_str().into();
+            }
+            if let Some(scope) = self.router.credential_scope(model) {
+                entry["credentialScope"] = scope.into();
             }
             models.push(entry);
         }

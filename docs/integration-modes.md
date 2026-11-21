@@ -67,6 +67,10 @@ The routes document is one object:
 ```json
 {
   "upstreamDeadlineSecs": 600,
+  "credentialScopes": {
+    "openai-key": ["<credentialId>"],
+    "vendor-key": ["<otherCredentialId>"]
+  },
   "routes": [
     {
       "model": "chat",
@@ -74,6 +78,7 @@ The routes document is one object:
       "upstreamModel": "gpt-5.2",
       "protocol": "openai-responses",
       "auth": "api-key",
+      "credentialScope": "openai-key",
       "vars": {"resource": "my-account"}
     },
     {
@@ -84,6 +89,7 @@ The routes document is one object:
       },
       "auth": "api-key",
       "authHeader": "authorization",
+      "credentialScope": "vendor-key",
       "upstreamModel": "vendor-large"
     }
   ]
@@ -95,8 +101,18 @@ The routes document is one object:
   neither is refused. `upstreamModel` (default: `model`) is the id the
   upstream call receives and `auth` (default `none`) is the mechanism
   the lease must answer — `none`, `api-key`, `bearer`,
-  `cloud:<service>` or `external:<client>`. A malformed entry refuses
-  startup rather than running half a table.
+  `cloud:<service>` or `external:<client>`; a supplied value that is
+  not one of those strings refuses the entry rather than degrading to
+  `none`. A malformed entry refuses startup rather than running half a
+  table.
+- `credentialScopes` (optional) is the host-authorized table every
+  `credentialScope` names: a scope to the `credentialId`s from the
+  handoff it may resolve. An `api-key` or `bearer` route must declare
+  `credentialScope`; a route on any other mechanism may not. A scope
+  the table does not authorize, or one whose ids the handoff lacks,
+  resolves nothing — the route fails closed rather than borrowing
+  another vendor's credential. This is what keeps catalog and custom
+  routes that both ride `api-key` on separate keys.
 - A `provider` entry binds a catalog profile: `protocol` and `region`
   pin the profile's surface, and the profile must accept `auth`.
 - An `endpoint` entry binds a vendor the catalog does not carry, purely
@@ -113,7 +129,12 @@ The routes document is one object:
   `*.internal` or a loopback/private/link-local IP; and with any
   `auth` but `none`, `http` only to a private/loopback IP literal or
   `localhost`/`*.localhost`. The entry takes no top-level `protocol`,
-  `region` or `vars`.
+  `region` or `vars`. Its `auth` is limited to the leased mechanisms —
+  `none`, `api-key`, `bearer`: the sidecar's lease resolver cannot
+  answer `cloud:*` or `external:*`, so an endpoint route naming one is
+  refused at declaration instead of failing every forward. Requests
+  never follow redirects — the validated origin is the only place
+  credential headers may go.
 - `authHeader` (endpoint entries only, optional) declares the header the
   vendor expects the credential in. a4mp's adapter for the protocol owns
   placement — `authorization` (`Bearer`) for the OpenAI families,
@@ -125,8 +146,8 @@ The routes document is one object:
 - `models.list` renders a provider entry with `provider` and `protocol`,
   and an endpoint entry with `endpoint` (the base URL's host and port,
   never its path), `protocol` and `authHeader` — both with `auth`,
-  `upstreamModel` and `bound`. Endpoint routes meter under the
-  `custom` provider namespace.
+  `upstreamModel`, `credentialScope` when declared and `bound`. Endpoint
+  routes meter under the `custom` provider namespace.
 - `routes[].vars` (default `{}`) supplies the profile's runtime
   variables — `{name}` placeholders in its service target. Local
   profiles carry no built-in address: their endpoint is supplied here

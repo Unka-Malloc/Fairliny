@@ -57,7 +57,16 @@ JSON reply per stdout line.
   both — any vendor the catalog lacks is declared that way. A malformed
   route entry refuses startup rather than running half a
   route table; unknown models and unaccepted auth mechanisms fail
-  closed.
+  closed. A supplied `auth` of the wrong type refuses too — it is never
+  silently treated as `none` — and an endpoint route can only name a
+  leased mechanism (`none`, `api-key`, `bearer`).
+- One handoff may carry several vendors' credentials: `api-key`/`bearer`
+  entries declare `credentialScope`, naming an entry in the document's
+  `credentialScopes` table — the `credentialId`s the host authorized
+  for that route's surface. A scope holding no matching credential
+  fails closed; two vendors on `api-key` never share a key. Upstream
+  requests never follow redirects — the validated endpoint origin is
+  the only place credential headers go.
 - `upstreamDeadlineSecs` in the routes document is the host's opt-in
   bound on one upstream provider call: absent or `0` waits unbounded —
   a viable call ends by caller cancellation or provider answer, never by

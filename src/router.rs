@@ -2,20 +2,21 @@
 //!
 //! The router owns the outward face's one indirection: the model name a
 //! caller sends is never the name the upstream sees. A [`Route`] binds an
-//! outward name to one provider access surface — a catalog profile with
-//! optional protocol and region pins, or an explicit endpoint the host
-//! declares outside the catalog — plus the auth mechanism the host will
-//! answer and the upstream model id, and [`Router::resolve`] turns the
+//! outward name to a catalog profile with optional protocol and region
+//! pins, an [`EndpointRoute`] binds one to an explicit endpoint the host
+//! declares outside the catalog, and [`Router::resolve`] turns either
 //! binding into a live a4mp [`Adapter`].
 //!
 //! Failure is closed by construction: an unknown model is refused before
 //! any provider is touched, a profile route can only name a provider the
 //! catalog carries and an auth mechanism its profile accepts, an endpoint
 //! route can only reach its URL under the cleartext-credential policy
-//! a4mp applies to profile endpoints, and an adapter the host bound
-//! itself arrives already live through [`Router::register_adapter`]. The
-//! router holds no credential material — it hands a4mp the resolver and
-//! the lease port answers per call.
+//! a4mp applies to profile endpoints and only through the leased auth
+//! mechanisms, and an adapter the host bound itself arrives already live
+//! through [`Router::register_adapter`]. The router holds no credential
+//! material — it hands a4mp the resolver, and a scoped route's surface is
+//! registered against its declared credential scope so the lease port
+//! answers only what the host authorized for it.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -26,6 +27,7 @@ use a4mp::{
 use serde_json::Value;
 use url::Url;
 
+use crate::leases::{Leases, ProviderCredential};
 use crate::{Error, Result};
 
 /// The provider id endpoint routes bind under. An endpoint route names no
@@ -33,141 +35,197 @@ use crate::{Error, Result};
 /// (`custom.usage`) carry this id instead.
 pub const CUSTOM_PROVIDER: &str = "custom";
 
-/// Where a route forwards: a catalog profile or an explicit endpoint.
-#[derive(Clone, Debug)]
-pub enum Access {
-    /// A provider profile the a4mp catalog carries.
-    Profile {
-        /// The catalog profile this model forwards to.
-        provider: ProviderId,
-        /// The protocol family to bind, or the profile's primary target.
-        protocol: Option<Protocol>,
-        /// A regional plan the profile declares, when the route pins one.
-        region: Option<String>,
-        /// Endpoint variables the profile's target template requires —
-        /// `{endpoint}` for runtime-supplied base URLs, `{resource}`-class
-        /// atoms for per-resource clouds. Supplied per route so no address
-        /// is ever built into the catalog.
-        vars: BTreeMap<String, String>,
-    },
-    /// A service the catalog does not carry, declared entirely by the
-    /// host: base URL plus the wire protocol it speaks.
-    Endpoint {
-        /// The base URL protocol paths join onto. `http(s)` only, with no
-        /// embedded credentials, query or fragment.
-        base_url: Url,
-        /// The wire protocol family the endpoint speaks.
-        protocol: Protocol,
-        /// The header the host expects the credential in. a4mp's adapter
-        /// for `protocol` owns credential placement, so this is a declared
-        /// expectation checked against that placement, never a new one.
-        auth_header: Option<String>,
-    },
-}
-
-/// One outward model name bound to a provider access surface.
+/// One outward model name bound to a catalog provider profile.
 #[derive(Clone, Debug)]
 pub struct Route {
-    /// The surface this model forwards to.
-    pub access: Access,
-    /// The mechanism the adapter asks the resolver for. A profile must
+    /// The catalog profile this model forwards to.
+    pub provider: ProviderId,
+    /// The protocol family to bind, or the profile's primary target.
+    pub protocol: Option<Protocol>,
+    /// A regional plan the profile declares, when the route pins one.
+    pub region: Option<String>,
+    /// The mechanism the adapter asks the resolver for. The profile must
     /// accept it — a route cannot widen a profile's access surface.
+    pub auth: AuthKind,
+    /// The identifier the upstream call receives. May differ from the
+    /// outward name so aliases never leak deployment naming upstream.
+    pub upstream_model: String,
+    /// Endpoint variables the profile's target template requires —
+    /// `{endpoint}` for runtime-supplied base URLs, `{resource}`-class
+    /// atoms for per-resource clouds. Supplied per route so no address is
+    /// ever built into the catalog.
+    pub vars: BTreeMap<String, String>,
+}
+
+/// One outward model name bound to an explicit endpoint — a service the
+/// catalog does not carry, declared entirely by the host: base URL plus
+/// the wire protocol it speaks.
+#[derive(Clone, Debug)]
+pub struct EndpointRoute {
+    /// The base URL protocol paths join onto. `http(s)` only, with no
+    /// embedded credentials, query or fragment.
+    pub base_url: Url,
+    /// The wire protocol family the endpoint speaks.
+    pub protocol: Protocol,
+    /// The header the host expects the credential in. a4mp's adapter for
+    /// `protocol` owns credential placement, so this is a declared
+    /// expectation checked against that placement, never a new one.
+    pub auth_header: Option<String>,
+    /// The mechanism the adapter asks the resolver for. An endpoint route
+    /// can only name a leased mechanism — `none`, `api-key`, `bearer` —
+    /// because the custody port cannot answer cloud identity or an
+    /// external client's access.
     pub auth: AuthKind,
     /// The identifier the upstream call receives. May differ from the
     /// outward name so aliases never leak deployment naming upstream.
     pub upstream_model: String,
 }
 
-impl Route {
-    /// Parse one routes-document entry into the outward name and its
-    /// route. An entry names exactly one surface: `{model, provider,
-    /// protocol?, region?, vars?, auth?, upstreamModel?}` for a catalog
-    /// profile, or `{model, endpoint: {baseUrl, protocol}, auth?,
-    /// authHeader?, upstreamModel?}` for an explicit endpoint.
-    /// The protocol and auth vocabulary is the same table `models.list`
-    /// renders and errors quote: every label the gateway emits is a label
-    /// the document accepts.
-    pub fn from_document(entry: &Value) -> Result<(String, Self)> {
-        let invalid = |field: &str| Error::Request(format!("route entry requires a valid {field}"));
-        let model = entry
-            .get("model")
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid("model"))?
-            .to_owned();
-        let auth = parse_auth(entry.get("auth").and_then(Value::as_str).unwrap_or("none"))?;
-        let upstream_model = entry
-            .get("upstreamModel")
-            .and_then(Value::as_str)
-            .unwrap_or(&model)
-            .to_owned();
-        let protocol = |value: Option<&Value>| {
+/// `route entry requires a valid {field}` — the shared refusal every
+/// document parser produces for a missing or mistyped member.
+fn invalid(field: &str) -> Error {
+    Error::Request(format!("route entry requires a valid {field}"))
+}
+
+/// The entry fields both route shapes share, parsed once each: `model`
+/// (required), `auth` (default `none`), `upstreamModel` (default
+/// `model`). A present-but-mistyped member refuses — a supplied `auth`,
+/// `region` or `upstreamModel` is never silently degraded into a default
+/// the document did not declare.
+fn entry_fields(entry: &Value) -> Result<(String, AuthKind, String)> {
+    let model = entry
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("model"))?
+        .to_owned();
+    let auth = match entry.get("auth") {
+        None => AuthKind::None,
+        Some(value) => parse_auth(value.as_str().ok_or_else(|| invalid("auth"))?)?,
+    };
+    let upstream_model = match entry.get("upstreamModel") {
+        None => model.clone(),
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| invalid("upstreamModel"))?
+            .to_owned(),
+    };
+    Ok((model, auth, upstream_model))
+}
+
+/// An entry's declared credential scope: `credentialScope` must be a
+/// non-empty string when present. The scope-to-credential authorization
+/// lives in the document's `credentialScopes` table, not on the entry.
+fn entry_credential_scope(entry: &Value) -> Result<Option<String>> {
+    entry
+        .get("credentialScope")
+        .map(|value| {
             value
-                .map(|v| v.as_str().ok_or_else(|| invalid("protocol")))
-                .transpose()?
-                .map(parse_protocol)
-                .transpose()
-        };
-        let access = match (entry.get("provider"), entry.get("endpoint")) {
-            (Some(_), Some(_)) => {
-                return Err(Error::Request(
-                    "route entry names both a provider and an endpoint".to_owned(),
-                ));
-            }
-            (None, None) => {
-                return Err(Error::Request(
-                    "route entry requires a provider or an endpoint".to_owned(),
-                ));
-            }
-            (Some(provider), None) => {
-                let provider = provider.as_str().ok_or_else(|| invalid("provider"))?;
-                if entry.get("authHeader").is_some() {
-                    return Err(Error::Request(
-                        "authHeader applies to endpoint routes; a profile's adapter \
-                         places its own credential"
-                            .to_owned(),
-                    ));
-                }
-                Access::Profile {
-                    provider: ProviderId::new(provider),
-                    protocol: protocol(entry.get("protocol"))?,
-                    region: entry
-                        .get("region")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    vars: parse_vars(entry.get("vars"))?,
-                }
-            }
-            (None, Some(endpoint)) => {
-                if let Some(field) = ["protocol", "region", "vars"]
-                    .into_iter()
-                    .find(|field| entry.get(field).is_some())
-                {
-                    return Err(Error::Request(format!(
-                        "an endpoint route declares no top-level {field}: the \
-                         protocol belongs inside endpoint"
-                    )));
-                }
-                let base_url = endpoint
-                    .get("baseUrl")
-                    .and_then(Value::as_str)
-                    .and_then(|url| Url::parse(url).ok())
-                    .ok_or_else(|| invalid("endpoint.baseUrl"))?;
-                Access::Endpoint {
-                    base_url,
-                    protocol: protocol(endpoint.get("protocol"))?
-                        .ok_or_else(|| invalid("endpoint.protocol"))?,
-                    auth_header: entry
-                        .get("authHeader")
-                        .map(|v| v.as_str().ok_or_else(|| invalid("authHeader")))
-                        .transpose()?
-                        .map(str::to_owned),
-                }
-            }
-        };
+                .as_str()
+                .filter(|scope| !scope.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| invalid("credentialScope"))
+        })
+        .transpose()
+}
+
+impl Route {
+    /// Parse one routes-document entry `{model, provider, upstreamModel?,
+    /// protocol?, region?, auth?, vars?, credentialScope?}` into the
+    /// outward name and its profile route. The protocol and auth
+    /// vocabulary is the same table `models.list` renders and errors
+    /// quote: every label the gateway emits is a label the document
+    /// accepts.
+    pub fn from_document(entry: &Value) -> Result<(String, Self)> {
+        let (model, auth, upstream_model) = entry_fields(entry)?;
+        if entry.get("endpoint").is_some() {
+            return Err(if entry.get("provider").is_some() {
+                Error::Request("route entry names both a provider and an endpoint".to_owned())
+            } else {
+                invalid("provider")
+            });
+        }
+        if entry.get("authHeader").is_some() {
+            return Err(Error::Request(
+                "authHeader applies to endpoint routes; a profile's adapter \
+                 places its own credential"
+                    .to_owned(),
+            ));
+        }
+        let provider = entry
+            .get("provider")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("provider"))?;
+        let protocol = entry
+            .get("protocol")
+            .map(|v| v.as_str().ok_or_else(|| invalid("protocol")))
+            .transpose()?
+            .map(parse_protocol)
+            .transpose()?;
+        let region = entry
+            .get("region")
+            .map(|v| v.as_str().ok_or_else(|| invalid("region")))
+            .transpose()?;
         Ok((
             model,
             Self {
-                access,
+                provider: ProviderId::new(provider),
+                protocol,
+                region: region.map(str::to_owned),
+                auth,
+                upstream_model,
+                vars: parse_vars(entry.get("vars"))?,
+            },
+        ))
+    }
+}
+
+impl EndpointRoute {
+    /// Parse one routes-document entry `{model, endpoint: {baseUrl,
+    /// protocol}, auth?, authHeader?, upstreamModel?, credentialScope?}`
+    /// into the outward name and its endpoint route. An endpoint entry
+    /// declares no top-level `protocol`, `region` or `vars` — the
+    /// protocol belongs inside `endpoint`, and a service outside the
+    /// catalog has no profile surface to pin.
+    pub fn from_document(entry: &Value) -> Result<(String, Self)> {
+        let (model, auth, upstream_model) = entry_fields(entry)?;
+        if entry.get("provider").is_some() {
+            return Err(Error::Request(
+                "route entry names both a provider and an endpoint".to_owned(),
+            ));
+        }
+        if let Some(field) = ["protocol", "region", "vars"]
+            .into_iter()
+            .find(|field| entry.get(field).is_some())
+        {
+            return Err(Error::Request(format!(
+                "an endpoint route declares no top-level {field}: the \
+                 protocol belongs inside endpoint"
+            )));
+        }
+        let endpoint = entry.get("endpoint").ok_or_else(|| invalid("endpoint"))?;
+        let base_url = endpoint
+            .get("baseUrl")
+            .and_then(Value::as_str)
+            .and_then(|url| Url::parse(url).ok())
+            .ok_or_else(|| invalid("endpoint.baseUrl"))?;
+        let protocol = endpoint
+            .get("protocol")
+            .map(|v| v.as_str().ok_or_else(|| invalid("endpoint.protocol")))
+            .transpose()?
+            .map(parse_protocol)
+            .transpose()?
+            .ok_or_else(|| invalid("endpoint.protocol"))?;
+        let auth_header = entry
+            .get("authHeader")
+            .map(|v| v.as_str().ok_or_else(|| invalid("authHeader")))
+            .transpose()?
+            .map(str::to_owned);
+        Ok((
+            model,
+            Self {
+                base_url,
+                protocol,
+                auth_header,
                 auth,
                 upstream_model,
             },
@@ -213,9 +271,18 @@ pub struct BoundRoute {
 pub struct Router {
     client: a4mp::Client,
     routes: BTreeMap<String, Route>,
+    /// Vendors the catalog does not carry, bound by explicit endpoint.
+    endpoint_routes: BTreeMap<String, EndpointRoute>,
+    /// The credential scope each declared route named — a
+    /// host-authorized entry in the lease port's scope table.
+    scopes: BTreeMap<String, String>,
     /// Adapters the host bound itself — custom surfaces and test stubs.
     /// They skip profile checks because the host already owns the binding.
     prebound: BTreeMap<String, (Arc<dyn Adapter>, String)>,
+    /// The lease port scoped surfaces register against. Present only
+    /// when the router's resolver is the crate's own custody port —
+    /// [`Router::with_leases`] wires both from one `Arc`.
+    leases: Option<Arc<Leases>>,
 }
 
 impl Router {
@@ -235,65 +302,196 @@ impl Router {
         Self {
             client: a4mp::Client::new(catalog, transport, resolver),
             routes: BTreeMap::new(),
+            endpoint_routes: BTreeMap::new(),
+            scopes: BTreeMap::new(),
             prebound: BTreeMap::new(),
+            leases: None,
         }
     }
 
-    /// Bind an outward model name to a provider surface.
+    /// A router over the built-in catalog whose resolver is the crate's
+    /// lease port. Scoped routes register their bound surfaces against
+    /// it at declaration, so each authenticated surface resolves only
+    /// the credentials the host authorized for its scope.
+    pub fn with_leases(transport: Arc<dyn Transport>, leases: Arc<Leases>) -> Self {
+        Self::with_catalog_leases(a4mp::Catalog::with_builtin_adapters(), transport, leases)
+    }
+
+    /// [`Self::with_leases`] over an explicit catalog.
+    pub fn with_catalog_leases(
+        catalog: a4mp::Catalog,
+        transport: Arc<dyn Transport>,
+        leases: Arc<Leases>,
+    ) -> Self {
+        let mut router = Self::with_catalog(catalog, transport, leases.clone());
+        router.leases = Some(leases);
+        router
+    }
+
+    /// Bind an outward model name to a catalog provider profile.
     ///
-    /// Fails closed at declaration time. A profile route's provider must
-    /// resolve through the catalog, the profile must accept the declared
-    /// auth mechanism, and the declared variables must materialize the
-    /// profile's target template. An endpoint route's URL must be a bare
-    /// `http(s)` base under the cleartext-credential policy, and a
-    /// declared `auth_header` must be where a4mp places the credential.
-    /// The same bind `resolve` performs is run once here, so a typo'd
-    /// provider, mechanism, variable key or protocol is refused before
-    /// traffic ever reaches the route, not at first `chat.complete`.
+    /// Fails closed at declaration time: the provider must resolve
+    /// through the catalog, the profile must accept the declared auth
+    /// mechanism, and the declared variables must materialize the
+    /// profile's target template — the same bind `resolve` performs is
+    /// run once here, so a typo'd provider, mechanism, variable key or
+    /// protocol is refused before traffic ever reaches the route, not at
+    /// first `chat.complete`.
+    ///
+    /// An `api-key`/`bearer` route must name its credential scope —
+    /// [`Router::add_route_scoped`] — so a leased credential can never
+    /// ride a surface the host did not authorize for it.
     pub fn add_route(&mut self, model: impl Into<String>, route: Route) -> Result<()> {
-        let model = model.into();
+        self.add_profile(model.into(), route, None)
+    }
+
+    /// [`Self::add_route`] plus the credential scope the host authorized
+    /// for the route's bound surface. The scope names an authorization in
+    /// the lease port's scope table; a scope holding no credential fails
+    /// closed at resolution rather than borrowing another's.
+    pub fn add_route_scoped(
+        &mut self,
+        model: impl Into<String>,
+        route: Route,
+        credential_scope: impl Into<String>,
+    ) -> Result<()> {
+        self.add_profile(model.into(), route, Some(credential_scope.into()))
+    }
+
+    /// Bind an outward model name to an explicit endpoint — a vendor the
+    /// catalog does not carry, declared purely by configuration.
+    ///
+    /// Fails closed at declaration time: the URL must be a bare `http(s)`
+    /// base under the same cleartext-credential policy a4mp applies to
+    /// profile endpoints, the auth mechanism must be a leased kind —
+    /// `none`, `api-key` or `bearer`, never cloud identity or external
+    /// access the custody port cannot answer — and a declared
+    /// `auth_header` must be where a4mp places the credential.
+    ///
+    /// An `api-key`/`bearer` route must name its credential scope —
+    /// [`Router::add_endpoint_route_scoped`].
+    pub fn add_endpoint_route(
+        &mut self,
+        model: impl Into<String>,
+        route: EndpointRoute,
+    ) -> Result<()> {
+        self.add_endpoint(model.into(), route, None)
+    }
+
+    /// [`Self::add_endpoint_route`] plus the credential scope the host
+    /// authorized for the route's bound surface.
+    pub fn add_endpoint_route_scoped(
+        &mut self,
+        model: impl Into<String>,
+        route: EndpointRoute,
+        credential_scope: impl Into<String>,
+    ) -> Result<()> {
+        self.add_endpoint(model.into(), route, Some(credential_scope.into()))
+    }
+
+    /// The shared declaration path for profile routes: scope contract,
+    /// catalog checks, one declaration bind, then the scope registration
+    /// and the table insert.
+    fn add_profile(&mut self, model: String, route: Route, scope: Option<String>) -> Result<()> {
         let refuse = |reason: String| Error::Route {
             model: model.clone(),
             reason,
         };
-        match &route.access {
-            Access::Profile { provider, .. } => {
-                let profile = self
-                    .client
-                    .catalog()
-                    .resolve(provider.as_str())
-                    .ok_or_else(|| refuse(format!("unknown provider {provider}")))?;
-                if !accepts(&profile.auth, &route.auth) {
-                    return Err(refuse(format!(
-                        "profile {} does not accept {}",
-                        profile.id,
-                        auth_label(&route.auth)
-                    )));
-                }
-            }
-            Access::Endpoint {
-                base_url,
-                protocol,
-                auth_header,
-            } => {
-                check_base_url(base_url).map_err(refuse)?;
-                if let Some(header) = auth_header {
-                    check_auth_header(protocol, &route.auth, header).map_err(refuse)?;
-                }
-            }
+        check_credential_scope(&route.auth, &scope).map_err(refuse)?;
+        if self.endpoint_routes.contains_key(&model) {
+            return Err(refuse(
+                "model is already bound to an endpoint route".to_owned(),
+            ));
+        }
+        let profile = self
+            .client
+            .catalog()
+            .resolve(route.provider.as_str())
+            .ok_or_else(|| refuse(format!("unknown provider {}", route.provider)))?;
+        if !accepts(&profile.auth, &route.auth) {
+            return Err(refuse(format!(
+                "profile {} does not accept {}",
+                profile.id,
+                auth_label(&route.auth)
+            )));
         }
         // Declaration binds once and drops the adapter — resolve binds
         // its own per call. Running the bind here is what refuses a
         // missing or misspelled endpoint variable, an unbound protocol or
         // a cleartext credential path at startup.
-        self.bind(&route).map_err(refuse)?;
+        let adapter = self.bind_profile(&route).map_err(refuse)?;
+        self.register_scope(&model, adapter.target(), scope)
+            .map_err(refuse)?;
         self.routes.insert(model, route);
         Ok(())
     }
 
-    /// Load a routes document `{"routes":[{model,provider|endpoint,...}]}`.
-    /// A malformed entry refuses the whole table — the gateway never
-    /// silently runs half a route table.
+    /// The endpoint counterpart of [`Self::add_profile`].
+    fn add_endpoint(
+        &mut self,
+        model: String,
+        route: EndpointRoute,
+        scope: Option<String>,
+    ) -> Result<()> {
+        let refuse = |reason: String| Error::Route {
+            model: model.clone(),
+            reason,
+        };
+        check_credential_scope(&route.auth, &scope).map_err(refuse)?;
+        if !matches!(route.auth, AuthKind::None)
+            && ProviderCredential::for_auth(&route.auth).is_none()
+        {
+            return Err(refuse(format!(
+                "endpoint auth {} is not leased: an endpoint resolves \
+                 api-key, bearer or none — cloud identity and external \
+                 access stay with the host's own custody",
+                auth_label(&route.auth)
+            )));
+        }
+        if self.routes.contains_key(&model) {
+            return Err(refuse(
+                "model is already bound to a profile route".to_owned(),
+            ));
+        }
+        check_base_url(&route.base_url).map_err(refuse)?;
+        if let Some(header) = &route.auth_header {
+            check_auth_header(&route.protocol, &route.auth, header).map_err(refuse)?;
+        }
+        let adapter = self.bind_endpoint(&route).map_err(refuse)?;
+        self.register_scope(&model, adapter.target(), scope)
+            .map_err(refuse)?;
+        self.endpoint_routes.insert(model, route);
+        Ok(())
+    }
+
+    /// Register a declared credential scope against the surface the
+    /// declaration bind produced, and record it for projections. No-op
+    /// for unscoped routes and for routers whose resolver is not the
+    /// crate's lease port — a host-supplied resolver owns its own
+    /// credential dispatch.
+    fn register_scope(
+        &mut self,
+        model: &str,
+        target: &ServiceTarget,
+        scope: Option<String>,
+    ) -> std::result::Result<(), String> {
+        let Some(scope) = scope else {
+            return Ok(());
+        };
+        if let Some(leases) = &self.leases {
+            leases
+                .register_target_scope(target, &scope)
+                .map_err(|error| error.to_string())?;
+        }
+        self.scopes.insert(model.to_owned(), scope);
+        Ok(())
+    }
+
+    /// Load a routes document `{"routes":[{model,provider|endpoint,...,
+    /// credentialScope?}]}` — plus the `credentialScopes` authorization
+    /// table the scopes name, which the lease port reads. A malformed
+    /// entry refuses the whole table — the gateway never silently runs
+    /// half a route table.
     pub fn load_routes(&mut self, document: &Value) -> Result<()> {
         let empty = Vec::new();
         let routes = document
@@ -301,8 +499,36 @@ impl Router {
             .and_then(Value::as_array)
             .unwrap_or(&empty);
         for entry in routes {
-            let (model, route) = Route::from_document(entry)?;
-            self.add_route(model, route)?;
+            let credential_scope = entry_credential_scope(entry)?;
+            match (
+                entry.get("provider").is_some(),
+                entry.get("endpoint").is_some(),
+            ) {
+                (true, true) => {
+                    return Err(Error::Request(
+                        "route entry names both a provider and an endpoint".to_owned(),
+                    ));
+                }
+                (false, false) => {
+                    return Err(Error::Request(
+                        "route entry requires a provider or an endpoint".to_owned(),
+                    ));
+                }
+                (true, false) => {
+                    let (model, route) = Route::from_document(entry)?;
+                    match credential_scope {
+                        Some(scope) => self.add_route_scoped(model, route, scope)?,
+                        None => self.add_route(model, route)?,
+                    }
+                }
+                (false, true) => {
+                    let (model, route) = EndpointRoute::from_document(entry)?;
+                    match credential_scope {
+                        Some(scope) => self.add_endpoint_route_scoped(model, route, scope)?,
+                        None => self.add_endpoint_route(model, route)?,
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -319,9 +545,19 @@ impl Router {
             .insert(model.into(), (adapter, upstream_model.into()));
     }
 
-    /// The declared routes, for read-only projections.
+    /// The declared profile routes, for read-only projections.
     pub fn routes(&self) -> impl Iterator<Item = (&String, &Route)> {
         self.routes.iter()
+    }
+
+    /// The declared endpoint routes, for read-only projections.
+    pub fn endpoint_routes(&self) -> impl Iterator<Item = (&String, &EndpointRoute)> {
+        self.endpoint_routes.iter()
+    }
+
+    /// The credential scope a declared route named, for projections.
+    pub fn credential_scope(&self, model: &str) -> Option<&str> {
+        self.scopes.get(model).map(String::as_str)
     }
 
     /// The host-bound adapters, for read-only projections.
@@ -345,50 +581,83 @@ impl Router {
                 provider: adapter.target().provider.clone(),
             });
         }
-        let route = self
-            .routes
-            .get(model)
-            .ok_or_else(|| Error::UnknownModel(model.to_owned()))?;
-        let adapter = self.bind(route).map_err(|reason| Error::Route {
+        let refused = |reason: String| Error::Route {
             model: model.to_owned(),
             reason,
-        })?;
-        Ok(BoundRoute {
-            adapter,
-            upstream_model: route.upstream_model.clone(),
-            provider: match &route.access {
-                Access::Profile { provider, .. } => provider.clone(),
-                Access::Endpoint { .. } => ProviderId::new(CUSTOM_PROVIDER),
-            },
-        })
+        };
+        if let Some(route) = self.routes.get(model) {
+            return Ok(BoundRoute {
+                adapter: self.bind_profile(route).map_err(refused)?,
+                upstream_model: route.upstream_model.clone(),
+                provider: route.provider.clone(),
+            });
+        }
+        if let Some(route) = self.endpoint_routes.get(model) {
+            return Ok(BoundRoute {
+                adapter: self.bind_endpoint(route).map_err(refused)?,
+                upstream_model: route.upstream_model.clone(),
+                provider: ProviderId::new(CUSTOM_PROVIDER),
+            });
+        }
+        Err(Error::UnknownModel(model.to_owned()))
     }
 
-    /// The one bind both declaration and resolution run.
-    fn bind(&self, route: &Route) -> std::result::Result<Arc<dyn Adapter>, String> {
-        match &route.access {
-            Access::Profile {
-                provider,
-                protocol,
-                region,
-                vars,
-            } => self.client.bind_provider_with(
-                provider.as_str(),
-                protocol.clone(),
-                region.as_deref(),
+    /// The profile bind both declaration and resolution run.
+    fn bind_profile(&self, route: &Route) -> std::result::Result<Arc<dyn Adapter>, String> {
+        self.client
+            .bind_provider_with(
+                route.provider.as_str(),
+                route.protocol.clone(),
+                route.region.as_deref(),
                 route.auth.clone(),
-                &bind_vars(vars),
-            ),
-            Access::Endpoint {
-                base_url, protocol, ..
-            } => {
-                check_cleartext_policy(base_url, &route.auth)?;
-                self.client.bind_target(
-                    ServiceTarget::new(CUSTOM_PROVIDER, protocol.clone(), base_url.clone()),
-                    route.auth.clone(),
-                )
-            }
-        }
-        .map_err(|error| error.to_string())
+                &bind_vars(&route.vars),
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    /// The endpoint bind both declaration and resolution run — the
+    /// cleartext-credential policy profile endpoints get inside a4mp,
+    /// restated for an explicit target `bind_target` never checks.
+    fn bind_endpoint(
+        &self,
+        route: &EndpointRoute,
+    ) -> std::result::Result<Arc<dyn Adapter>, String> {
+        check_cleartext_policy(&route.base_url, &route.auth)?;
+        self.client
+            .bind_target(
+                ServiceTarget::new(
+                    CUSTOM_PROVIDER,
+                    route.protocol.clone(),
+                    route.base_url.clone(),
+                ),
+                route.auth.clone(),
+            )
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// The credential-scope contract for one declared route: a scope binds
+/// to a leased auth mechanism (`api-key`/`bearer`) — required for them,
+/// meaningless and refused for anything else.
+fn check_credential_scope(
+    auth: &AuthKind,
+    scope: &Option<String>,
+) -> std::result::Result<(), String> {
+    match (
+        ProviderCredential::for_auth(auth).is_some(),
+        scope.as_deref().filter(|scope| !scope.is_empty()),
+    ) {
+        (true, None) => Err(format!(
+            "{} requires a credential scope: the host authorizes which \
+             leased credentials a route may resolve",
+            auth_label(auth)
+        )),
+        (false, Some(_)) => Err(format!(
+            "credentialScope does not apply to {}: it binds leased \
+             credentials (api-key, bearer)",
+            auth_label(auth)
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -715,18 +984,19 @@ mod tests {
         .expect("entry");
         assert_eq!(model, "chat");
         assert_eq!(route.upstream_model, "llama3.1");
-        let Access::Profile { protocol, vars, .. } = &route.access else {
-            panic!("a provider entry is a profile route");
-        };
-        assert_eq!(protocol, &Some(Protocol::Other("ollama".to_owned())));
-        assert_eq!(vars["endpoint"], "http://localhost:11434");
+        assert_eq!(route.protocol, Some(Protocol::Other("ollama".to_owned())));
+        assert_eq!(route.vars["endpoint"], "http://localhost:11434");
 
-        // A missing required field or an unknown vocabulary word refuses
-        // the entry — never a half-parsed route.
+        // A missing required field, an unknown vocabulary word or a
+        // supplied member of the wrong type refuses the entry — never a
+        // half-parsed route, never a default the document did not declare.
         for entry in [
             serde_json::json!({"provider": "ollama"}),
             serde_json::json!({"model": "m", "provider": "ollama", "auth": "oauth-magic"}),
             serde_json::json!({"model": "m", "provider": "ollama", "protocol": "grpc"}),
+            serde_json::json!({"model": "m", "provider": "ollama", "auth": 5}),
+            serde_json::json!({"model": "m", "provider": "ollama", "upstreamModel": 5}),
+            serde_json::json!({"model": "m", "provider": "ollama", "region": 5}),
         ] {
             assert!(Route::from_document(&entry).is_err(), "{entry}");
         }
@@ -757,9 +1027,16 @@ mod tests {
         declaring_router().load_routes(&serde_json::json!({ "routes": [entry] }))
     }
 
+    /// An api-key endpoint entry plus the scope it declares — the shape
+    /// every leased-auth document entry must take.
+    fn scoped_entry(mut entry: Value) -> Value {
+        entry["credentialScope"] = "vendor-scope".into();
+        entry
+    }
+
     #[test]
     fn an_endpoint_entry_parses_into_a_custom_surface() {
-        let (model, route) = Route::from_document(&serde_json::json!({
+        let (model, route) = EndpointRoute::from_document(&serde_json::json!({
             "model": "vendor-chat",
             "endpoint": {"baseUrl": "https://api.vendor.example/v1", "protocol": "anthropic-messages"},
             "auth": "api-key",
@@ -770,31 +1047,25 @@ mod tests {
         assert_eq!(model, "vendor-chat");
         assert_eq!(route.upstream_model, "vendor-large");
         assert_eq!(auth_label(&route.auth), "api-key");
-        let Access::Endpoint {
-            base_url,
-            protocol,
-            auth_header,
-        } = &route.access
-        else {
-            panic!("an endpoint entry is an endpoint route");
-        };
-        assert_eq!(base_url.as_str(), "https://api.vendor.example/v1");
-        assert_eq!(protocol, &Protocol::AnthropicMessages);
-        assert_eq!(auth_header.as_deref(), Some("x-api-key"));
-        assert_eq!(endpoint_authority(base_url), "api.vendor.example");
+        assert_eq!(route.base_url.as_str(), "https://api.vendor.example/v1");
+        assert_eq!(route.protocol, Protocol::AnthropicMessages);
+        assert_eq!(route.auth_header.as_deref(), Some("x-api-key"));
+        assert_eq!(endpoint_authority(&route.base_url), "api.vendor.example");
 
         // Every protocol label the vocabulary names declares an endpoint.
         for (label, _) in PROTOCOL_VOCABULARY {
-            let (_, route) = Route::from_document(&serde_json::json!({
+            let (_, route) = EndpointRoute::from_document(&serde_json::json!({
                 "model": "m",
                 "endpoint": {"baseUrl": "https://api.vendor.example", "protocol": label}
             }))
             .expect(label);
-            assert!(matches!(route.access, Access::Endpoint { .. }), "{label}");
+            assert_eq!(&protocol_label(&route.protocol), label);
         }
 
         let mut router = declaring_router();
-        router.add_route(model, route).expect("declared");
+        router
+            .add_endpoint_route_scoped(model, route, "vendor-scope")
+            .expect("declared");
         let bound = router.resolve("vendor-chat").expect("bound");
         assert_eq!(bound.provider.as_str(), CUSTOM_PROVIDER);
         assert_eq!(bound.upstream_model, "vendor-large");
@@ -823,9 +1094,69 @@ mod tests {
                 "authHeader",
             ),
         ] {
-            let error = Route::from_document(&entry).expect_err("refused");
+            let error = declaring_router()
+                .load_routes(&serde_json::json!({ "routes": [entry] }))
+                .expect_err("refused");
             assert!(error.to_string().contains(needle), "{entry}: {error}");
         }
+    }
+
+    #[test]
+    fn a_leased_auth_route_must_name_its_credential_scope() {
+        let endpoint = serde_json::json!({"baseUrl": "https://api.vendor.example", "protocol": "openai-chat-completions"});
+        // api-key and bearer routes without a scope refuse — a leased
+        // credential can never ride a surface the host did not authorize.
+        for auth in ["api-key", "bearer"] {
+            for entry in [
+                serde_json::json!({"model": "m", "provider": "ollama", "auth": auth,
+                                   "protocol": "other:ollama",
+                                   "vars": {"endpoint": "https://a.example"}}),
+                serde_json::json!({"model": "m", "endpoint": endpoint, "auth": auth}),
+            ] {
+                let error = declare(entry).expect_err(auth);
+                assert!(
+                    error.to_string().contains("credential scope"),
+                    "{auth}: {error}"
+                );
+            }
+        }
+        // And a scope on a mechanism that cannot lease one is refused —
+        // the entry would pretend an authorization it does not have.
+        for entry in [
+            serde_json::json!({"model": "m", "provider": "ollama", "auth": "none",
+                               "credentialScope": "s",
+                               "vars": {"endpoint": "https://a.example"}}),
+            serde_json::json!({"model": "m", "endpoint": endpoint,
+                               "auth": "none", "credentialScope": "s"}),
+        ] {
+            let error = declare(entry).expect_err("scope on none");
+            assert!(error.to_string().contains("does not apply"), "{error}");
+        }
+        // A malformed scope member refuses rather than degrading.
+        for scope in [serde_json::json!(5), serde_json::json!("")] {
+            let error = declare(serde_json::json!({"model": "m", "endpoint": endpoint,
+                                   "auth": "api-key", "credentialScope": scope}))
+            .expect_err("bad scope");
+            assert!(error.to_string().contains("credentialScope"), "{error}");
+        }
+    }
+
+    #[test]
+    fn an_endpoint_route_only_accepts_leased_auth_mechanisms() {
+        let endpoint = serde_json::json!({"baseUrl": "https://api.vendor.example", "protocol": "openai-chat-completions"});
+        // Cloud identity and external access pass parsing — they are real
+        // vocabulary — but the custody port can never answer them, so an
+        // endpoint route naming one refuses at declaration, not at first
+        // forward.
+        for auth in ["cloud:aws", "external:acme.sso", "other:acme"] {
+            let error =
+                declare(serde_json::json!({"model": "m", "endpoint": endpoint, "auth": auth}))
+                    .expect_err(auth);
+            assert!(error.to_string().contains("not leased"), "{auth}: {error}");
+        }
+        // `none` needs no scope and no credential.
+        declare(serde_json::json!({"model": "m", "endpoint": endpoint, "auth": "none"}))
+            .expect("none binds");
     }
 
     #[test]
@@ -833,9 +1164,9 @@ mod tests {
         let entry = |url: &str, protocol: &str| serde_json::json!({"model": "m", "endpoint": {"baseUrl": url, "protocol": protocol}});
         // An unnamed label fails parsing; an `other:` protocol with no
         // adapter factory fails the declaration bind.
-        assert!(Route::from_document(&entry("https://a.example", "grpc")).is_err());
+        assert!(EndpointRoute::from_document(&entry("https://a.example", "grpc")).is_err());
         assert!(
-            Route::from_document(
+            EndpointRoute::from_document(
                 &serde_json::json!({"model": "m", "endpoint": {"baseUrl": "https://a.example"}})
             )
             .is_err()
@@ -845,7 +1176,9 @@ mod tests {
 
         // Unparseable, non-http, credential-bearing, query or fragment
         // URLs refuse — and the refusal never quotes the URL.
-        assert!(Route::from_document(&entry("not a url", "openai-chat-completions")).is_err());
+        assert!(
+            EndpointRoute::from_document(&entry("not a url", "openai-chat-completions")).is_err()
+        );
         for url in [
             "ftp://a.example/v1",
             "https://user:hunter2@a.example/v1",
@@ -875,18 +1208,22 @@ mod tests {
             ("openai-responses", "bearer", "authorization"),
             ("gemini-generate-content", "api-key", "x-goog-api-key"),
         ] {
-            declare(entry(protocol, auth, header)).expect(header);
+            declare(scoped_entry(entry(protocol, auth, header))).expect(header);
         }
         // a4mp carries no header name in `AuthKind`: a header its adapter
         // does not use is refused, naming the placement it does use.
-        let error = declare(entry("openai-chat-completions", "api-key", "x-api-key"))
-            .expect_err("openai sends authorization");
+        let error = declare(scoped_entry(entry(
+            "openai-chat-completions",
+            "api-key",
+            "x-api-key",
+        )))
+        .expect_err("openai sends authorization");
         assert!(error.to_string().contains("\"authorization\""), "{error}");
         let error = declare(entry("openai-chat-completions", "none", "authorization"))
             .expect_err("no credential, no header");
         assert!(error.to_string().contains("not expressible"), "{error}");
         assert!(
-            Route::from_document(&serde_json::json!({
+            EndpointRoute::from_document(&serde_json::json!({
                 "model": "m",
                 "endpoint": {"baseUrl": "https://a.example", "protocol": "openai-responses"},
                 "authHeader": 7
@@ -919,7 +1256,8 @@ mod tests {
         let error = declare(serde_json::json!({
             "model": "m",
             "endpoint": {"baseUrl": "http://models.internal:8000/v1", "protocol": "openai-chat-completions"},
-            "auth": "api-key"
+            "auth": "api-key",
+            "credentialScope": "vendor-scope"
         }))
         .expect_err("cleartext credentials to a resolved name");
         assert!(error.to_string().contains("cleartext"), "{error}");

@@ -10,7 +10,7 @@ use std::time::Duration;
 use credential_lease::{CredentialHandoff, LeaseEpochSource, LeasedCredential, SecretBytes};
 use fairliny_gateway::leases::{Leases, ProviderCredential};
 use fairliny_gateway::meter::Meter;
-use fairliny_gateway::router::{Access, Route, Router};
+use fairliny_gateway::router::{Route, Router};
 use fairliny_gateway::service::Service;
 
 /// An epoch source a test can rotate — the contract the custody owner
@@ -97,20 +97,33 @@ impl a4mp::Adapter for HungAdapter {
     }
 }
 
+/// A handoff document minted under `epoch` carrying one API-key
+/// credential per `(credential_id, secret)` pair — the material the
+/// host would hand this process.
+fn handoff_document(epoch: &str, credentials: &[(&str, &[u8])]) -> Vec<u8> {
+    let credentials = credentials
+        .iter()
+        .map(|(id, secret)| {
+            LeasedCredential::new(
+                (*id).to_owned(),
+                SecretBytes::try_from_bytes(secret.to_vec()).expect("secret"),
+                None,
+            )
+            .expect("credential")
+        })
+        .collect();
+    let mut map = BTreeMap::new();
+    map.insert(ProviderCredential::ApiKey, credentials);
+    let handoff =
+        CredentialHandoff::new(map, Duration::from_secs(3600), epoch.to_owned()).expect("handoff");
+    handoff.to_json().expect("document").expose_bytes().to_vec()
+}
+
 /// The lease the host would hand this process: one API-key credential in
 /// the `ProviderCredential` family, minted under `epoch`.
 fn handoff_bytes(epoch: &str) -> Vec<u8> {
-    let credential = LeasedCredential::new(
-        uuid::Uuid::new_v4().to_string(),
-        SecretBytes::try_from_bytes(b"test-credential-material".to_vec()).expect("secret"),
-        None,
-    )
-    .expect("credential");
-    let mut credentials = BTreeMap::new();
-    credentials.insert(ProviderCredential::ApiKey, vec![credential]);
-    let handoff = CredentialHandoff::new(credentials, Duration::from_secs(3600), epoch.to_owned())
-        .expect("handoff");
-    handoff.to_json().expect("document").expose_bytes().to_vec()
+    let id = uuid::Uuid::new_v4().to_string();
+    handoff_document(epoch, &[(&id, b"test-credential-material")])
 }
 
 /// The target every test adapter claims — a prebound stub surface.
@@ -869,17 +882,19 @@ fn the_binary_serves_ndjson_over_stdio() {
 fn a_route_naming_an_unknown_provider_fails_closed() {
     let resolver: Arc<dyn a4mp::CredentialResolver> = Arc::new(Leases::disconnected());
     let mut router = Router::new(Arc::new(a4mp::ReqwestTransport::new()), resolver);
+    // The published `Route` fields — `provider`, `protocol`, `region`,
+    // `vars` — stay the construction API this package version ships.
     let route = Route {
-        access: Access::Profile {
-            provider: a4mp::ProviderId::new("no-such-provider"),
-            protocol: None,
-            region: None,
-            vars: Default::default(),
-        },
+        provider: a4mp::ProviderId::new("no-such-provider"),
+        protocol: None,
+        region: None,
         auth: a4mp::AuthKind::ApiKey,
         upstream_model: "x".to_owned(),
+        vars: Default::default(),
     };
-    let error = router.add_route("model", route).expect_err("closed");
+    let error = router
+        .add_route_scoped("model", route, "vendor-scope")
+        .expect_err("closed");
     assert!(error.to_string().contains("unknown provider"));
     assert!(router.resolve("model").is_err());
 }
@@ -1459,10 +1474,34 @@ fn openai_reply() -> serde_json::Value {
     })
 }
 
+/// A custody port holding `credentials` in one lease, each authorized
+/// scope carrying exactly its own credential — the host-authorized shape
+/// every leased-auth route resolves through.
+fn scoped_leases(credentials: &[(&str, &[u8], &str)]) -> Arc<Leases> {
+    let epoch = Arc::new(Epochs {
+        current: Mutex::new(uuid::Uuid::new_v4().to_string()),
+    });
+    let epoch_id = epoch.current.lock().unwrap().clone();
+    let leases = Arc::new(Leases::disconnected());
+    for (credential_id, _, scope) in credentials {
+        leases
+            .authorize_scope(scope, [credential_id])
+            .expect("authorize");
+    }
+    let material: Vec<(&str, &[u8])> = credentials
+        .iter()
+        .map(|(id, secret, _)| (*id, *secret))
+        .collect();
+    leases
+        .install_handoff(&handoff_document(&epoch_id, &material), epoch)
+        .expect("install");
+    leases
+}
+
 /// Load one endpoint route whose base URL is the mock upstream plus
-/// `base_path` into a lease-backed router, serve `models.list` then one
-/// `chat.complete` for it, and return the replies plus what the upstream
-/// received.
+/// `base_path` into a scope-authorized, lease-backed router, serve
+/// `models.list` then one `chat.complete` for it, and return the replies
+/// plus what the upstream received.
 async fn serve_endpoint_route(
     route: serde_json::Value,
     base_path: &str,
@@ -1471,7 +1510,14 @@ async fn serve_endpoint_route(
     let (addr, upstream) = mock_upstream(reply);
     let mut route = route;
     route["endpoint"]["baseUrl"] = format!("http://{addr}{base_path}").into();
-    let mut router = Router::new(loopback_transport(), resolver_with_lease());
+    let credential_id = uuid::Uuid::new_v4().to_string();
+    let leases = if matches!(route["auth"].as_str(), Some("api-key" | "bearer")) {
+        route["credentialScope"] = "vendor-scope".into();
+        scoped_leases(&[(&credential_id, b"test-credential-material", "vendor-scope")])
+    } else {
+        Arc::new(Leases::disconnected())
+    };
+    let mut router = Router::with_leases(loopback_transport(), leases);
     router
         .load_routes(&serde_json::json!({ "routes": [route] }))
         .expect("endpoint route declares");
@@ -1627,4 +1673,113 @@ fn the_binary_serves_an_endpoint_route_from_its_config() {
         reply["result"]["body"]["choices"][0]["message"]["content"], "pong",
         "{reply}"
     );
+}
+
+#[tokio::test]
+async fn each_scoped_route_resolves_only_the_credentials_its_host_authorized() {
+    // Two vendors, two authorized scopes, one handoff carrying both
+    // keys: each route resolves only the credential its host authorized
+    // for its scope — the auth mechanism alone never picks one.
+    let (addr_a, upstream_a) = mock_upstream(openai_reply());
+    let (addr_b, upstream_b) = mock_upstream(openai_reply());
+    let id_a = uuid::Uuid::new_v4().to_string();
+    let id_b = uuid::Uuid::new_v4().to_string();
+    let leases = scoped_leases(&[
+        (&id_a, b"key-for-vendor-a", "vendor-a"),
+        (&id_b, b"key-for-vendor-b", "vendor-b"),
+    ]);
+    let mut router = Router::with_leases(loopback_transport(), leases);
+    router
+        .load_routes(&serde_json::json!({"routes": [
+            {"model": "a-chat",
+             "endpoint": {"baseUrl": format!("http://{addr_a}/v1"), "protocol": "openai-chat-completions"},
+             "auth": "api-key", "credentialScope": "vendor-a"},
+            {"model": "b-chat",
+             "endpoint": {"baseUrl": format!("http://{addr_b}/v1"), "protocol": "openai-chat-completions"},
+             "auth": "api-key", "credentialScope": "vendor-b"}
+        ]}))
+        .expect("routes");
+    let service = Service::new(router, Meter::unmetered());
+    let body = |model: &str| serde_json::json!({"model": model, "messages": [{"role": "user", "content": "ping"}]});
+    let mut input = request_line(1, "chat.complete", chat_params(body("a-chat"), None));
+    input.extend(request_line(
+        2,
+        "chat.complete",
+        chat_params(body("b-chat"), None),
+    ));
+    let replies = run(&service, &input).await;
+    assert!(reply_for(&replies, 1).get("error").is_none());
+    assert!(reply_for(&replies, 2).get("error").is_none());
+    let a = upstream_a.join().expect("upstream a");
+    let b = upstream_b.join().expect("upstream b");
+    assert_eq!(a.header("authorization"), Some("Bearer key-for-vendor-a"));
+    assert_eq!(b.header("authorization"), Some("Bearer key-for-vendor-b"));
+}
+
+#[tokio::test]
+async fn a_scope_whose_credential_the_handoff_lacks_fails_closed() {
+    // The scope is authorized — for a credential id the installed
+    // handoff does not carry. The scope's slot is empty, so every
+    // forward refuses with the lease contract's unavailable code rather
+    // than borrowing the lease's other credential.
+    let (addr, _upstream) = mock_upstream(openai_reply());
+    let real_id = uuid::Uuid::new_v4().to_string();
+    let ghost_id = uuid::Uuid::new_v4().to_string();
+    let epoch = Arc::new(Epochs {
+        current: Mutex::new(uuid::Uuid::new_v4().to_string()),
+    });
+    let epoch_id = epoch.current.lock().unwrap().clone();
+    let leases = Arc::new(Leases::disconnected());
+    leases
+        .authorize_scope("vendor-scope", [&ghost_id])
+        .expect("authorize");
+    leases
+        .install_handoff(
+            &handoff_document(&epoch_id, &[(&real_id, b"the-other-key")]),
+            epoch,
+        )
+        .expect("install");
+    let mut router = Router::with_leases(loopback_transport(), leases);
+    router
+        .load_routes(&serde_json::json!({"routes": [{
+            "model": "vendor-chat",
+            "endpoint": {"baseUrl": format!("http://{addr}/v1"), "protocol": "openai-chat-completions"},
+            "auth": "api-key", "credentialScope": "vendor-scope"
+        }]}))
+        .expect("declares");
+    let service = Service::new(router, Meter::unmetered());
+    let body = serde_json::json!({
+        "model": "vendor-chat",
+        "messages": [{"role": "user", "content": "ping"}]
+    });
+    let input = request_line(1, "chat.complete", chat_params(body, None));
+    let replies = run(&service, &input).await;
+    let reply = reply_for(&replies, 1);
+    assert!(
+        reply["error"]
+            .as_str()
+            .expect("error")
+            .contains("credential_lease_unavailable"),
+        "{reply}"
+    );
+}
+
+#[test]
+fn a_route_naming_a_scope_the_host_never_authorized_refuses_to_declare() {
+    // `credentialScope` names an entry in `credentialScopes`; a route
+    // pointing at nothing fails at startup, not at first forward.
+    let leases = scoped_leases(&[(
+        &uuid::Uuid::new_v4().to_string(),
+        b"test-credential-material",
+        "vendor-scope",
+    )]);
+    let mut router = Router::with_leases(loopback_transport(), leases);
+    let error = router
+        .load_routes(&serde_json::json!({"routes": [{
+            "model": "m",
+            "endpoint": {"baseUrl": "https://api.vendor.example", "protocol": "openai-chat-completions"},
+            "auth": "api-key", "credentialScope": "misspelled-scope"
+        }]}))
+        .expect_err("unauthorized scope");
+    assert!(error.to_string().contains("unauthorized"), "{error}");
 }

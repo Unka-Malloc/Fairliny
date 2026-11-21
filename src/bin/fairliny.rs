@@ -6,12 +6,17 @@
 //! sockets, the custody, and the epoch file it rotates to revoke.
 //!
 //! The routes document is `{"upstreamDeadlineSecs"?,
-//! "routes":[{model,provider,upstreamModel?,protocol?,region?,auth?,vars?}
-//! | {model,endpoint:{baseUrl,protocol},upstreamModel?,auth?,authHeader?}]}` —
-//! the deadline bounds one upstream call when the host sets it (`0` or
-//! absent waits unbounded — the caller cancels; the sidecar never
-//! self-times-out viable work), and a malformed entry refuses startup
-//! rather than running half a table.
+//! "credentialScopes"?: {"<scope>": ["<credentialId>", ...]},
+//! "routes":[{model,provider,upstreamModel?,protocol?,region?,auth?,vars?,
+//! credentialScope?} | {model,endpoint:{baseUrl,protocol},upstreamModel?,
+//! auth?,authHeader?,credentialScope?}]}` — the deadline bounds one
+//! upstream call when the host sets it (`0` or absent waits unbounded —
+//! the caller cancels; the sidecar never self-times-out viable work), and
+//! a malformed entry refuses startup rather than running half a table.
+//! A `credentialScope` is required on `api-key`/`bearer` routes and names
+//! a `credentialScopes` authorization: the credential ids from the
+//! handoff that scope may resolve — a scope the document does not
+//! authorize holds no credential and fails closed.
 
 use std::path::PathBuf;
 use std::process::exit;
@@ -150,6 +155,19 @@ fn install_handoff_if_offered(leases: &Leases) -> Result<()> {
     }
 }
 
+/// The sidecar's HTTP client. Redirects are never followed: the router
+/// validates the configured endpoint origin, and a redirect could carry
+/// the credential headers adapters place (`x-api-key`,
+/// `x-goog-api-key`, `Authorization`) to an origin the host never
+/// validated. A provider that legitimately redirects answers 3xx, and
+/// the refusal surfaces through the adapter's own error path.
+fn upstream_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| Error::Request(format!("upstream transport: {error}")))
+}
+
 async fn serve(args: &[String]) -> Result<()> {
     let config_text = flag_value(args, "--config")
         .or_else(|| std::env::var("FAIRLINY_CONFIG").ok())
@@ -164,10 +182,13 @@ async fn serve(args: &[String]) -> Result<()> {
         None => Value::Null,
     };
 
-    let leases = Leases::disconnected();
+    let leases = Arc::new(Leases::disconnected());
+    // Authorize first, then install: a handoff's credentials land already
+    // divided into the scopes the document authorized.
+    leases.authorize_scopes(&config)?;
     install_handoff_if_offered(&leases)?;
-    let transport = Arc::new(a4mp::ReqwestTransport::new());
-    let mut router = Router::new(transport, Arc::new(leases));
+    let transport = Arc::new(a4mp::ReqwestTransport::with_client(upstream_client()?));
+    let mut router = Router::with_leases(transport, leases);
     router.load_routes(&config)?;
     let deadline = upstream_deadline(&config)?;
 
@@ -371,5 +392,40 @@ mod tests {
             .install_handoff_self_epoch(&document)
             .expect("install");
         assert!(leases.slot().resolve(ProviderCredential::ApiKey).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_upstream_redirect_is_never_followed() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listen");
+        let url = format!("http://{}/v1/chat", listener.local_addr().expect("addr"));
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request);
+            socket
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: https://elsewhere.example/\r\n\
+                      Content-Length: 0\r\n\r\n",
+                )
+                .expect("respond");
+        });
+        // A redirect is answered, not followed: the 3xx surfaces as the
+        // response and the credential headers never reach the redirect's
+        // origin.
+        let response = upstream_client()
+            .expect("client")
+            .get(&url)
+            .send()
+            .await
+            .expect("response");
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        server.join().expect("server");
     }
 }
