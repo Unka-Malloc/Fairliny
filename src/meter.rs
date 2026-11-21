@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use agent_statistics::gateway::UsageDocument;
@@ -54,9 +54,22 @@ const SOURCE_REF: &str = "source:fairliny.gateway#1";
 /// The extension id the binding declares — this gateway is the source.
 const EXTENSION_ID: &str = "fairliny.gateway";
 
+/// The marker `gateway-usage.json` has carried since the first published
+/// release: the counters document's wire shape is the sibling's
+/// `UsageDocument`, so the marker is recovered from that document's own
+/// serialized default rather than restated as a literal — counters a
+/// released build wrote keep opening, and the marker cannot drift from
+/// the shape it stamps.
+static COUNTERS_SCHEMA: LazyLock<String> = LazyLock::new(|| {
+    serde_json::to_value(UsageDocument::default())
+        .expect("UsageDocument serializes")
+        .get("schemaVersion")
+        .and_then(Value::as_str)
+        .expect("UsageDocument stamps a schema marker")
+        .to_owned()
+});
 /// Bounds mirror the recorder's own: same retention, same folding, so the
 /// exposition contract holds unchanged.
-const COUNTERS_SCHEMA: &str = "fairliny.gateway-usage.v1";
 const MAX_COUNTERS_BYTES: usize = 512 * 1024;
 const MAX_DAYS: usize = 90;
 const MAX_MODELS_PER_DAY: usize = 64;
@@ -96,7 +109,7 @@ struct Counters {
 impl Default for Counters {
     fn default() -> Self {
         Self {
-            schema_version: COUNTERS_SCHEMA.to_owned(),
+            schema_version: (*COUNTERS_SCHEMA).clone(),
             days: BTreeMap::new(),
         }
     }
@@ -125,7 +138,7 @@ impl Admissions {
         let counters = collection_store::fs::read_private_text_bounded(&path, MAX_COUNTERS_BYTES)
             .map_err(|error| Error::Meter(error.to_string()))?
             .and_then(|text| serde_json::from_str::<Counters>(&text).ok())
-            .filter(|document| document.schema_version == COUNTERS_SCHEMA)
+            .filter(|document| document.schema_version == *COUNTERS_SCHEMA)
             .unwrap_or_default();
         Ok(Self {
             path: Some(path),
@@ -605,6 +618,44 @@ mod tests {
         let reloaded = Admissions::open(path).unwrap();
         let day = OffsetDateTime::now_utc().date().to_string();
         assert_eq!(reloaded.counters.days[&day].models[FOLDED_LABEL], 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn counters_written_by_a_published_release_survive_reopen() {
+        let root =
+            std::env::temp_dir().join(format!("fairliny-admissions-{}", uuid::Uuid::new_v4()));
+        collection_store::fs::ensure_private_dir(&root).unwrap();
+        let path = root.join(COUNTERS_FILE);
+        // The document a released build stamps: the sibling's own
+        // `UsageDocument` default carries the published marker, so the
+        // fixture is the real artifact rather than a restated literal.
+        let mut released = serde_json::to_value(UsageDocument::default()).expect("document json");
+        released["days"] = json!({
+            "2000-01-01": {"agents": {"agent": 3}, "models": {"model": 5}}
+        });
+        collection_store::fs::atomic_write_private_text_bounded(
+            &path,
+            &released.to_string(),
+            MAX_COUNTERS_BYTES,
+        )
+        .expect("released counters");
+
+        // Reopening keeps the released counters instead of starting
+        // empty; the next admission lands beside them.
+        let mut admissions = Admissions::open(path.clone()).unwrap();
+        assert_eq!(admissions.counters.days["2000-01-01"].agents["agent"], 3);
+        assert_eq!(admissions.counters.days["2000-01-01"].models["model"], 5);
+        admissions.record("agent", "model");
+        admissions.persist().expect("persist");
+
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("counters file"))
+                .expect("counters json");
+        assert_eq!(written["schemaVersion"], released["schemaVersion"]);
+        assert_eq!(written["days"]["2000-01-01"]["agents"]["agent"], json!(3));
+        let day = OffsetDateTime::now_utc().date().to_string();
+        assert_eq!(written["days"][&day]["agents"]["agent"], json!(1));
         let _ = std::fs::remove_dir_all(root);
     }
 
