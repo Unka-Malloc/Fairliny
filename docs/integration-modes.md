@@ -75,17 +75,58 @@ The routes document is one object:
       "protocol": "openai-responses",
       "auth": "api-key",
       "vars": {"resource": "my-account"}
+    },
+    {
+      "model": "vendor-chat",
+      "endpoint": {
+        "baseUrl": "https://api.vendor.example/v1",
+        "protocol": "openai-chat-completions"
+      },
+      "auth": "api-key",
+      "authHeader": "authorization",
+      "upstreamModel": "vendor-large"
     }
   ]
 }
 ```
 
-- `routes[]` binds an outward `model` name to a catalog `provider`;
-  `upstreamModel` (default: `model`) is the id the upstream call
-  receives, `protocol` and `region` pin the profile's surface, and
-  `auth` (default `none`) is the mechanism the lease must answer —
-  `none`, `api-key`, `bearer`, `cloud:<service>` or `external:<client>`.
-  A malformed entry refuses startup rather than running half a table.
+- `routes[]` binds an outward `model` name to exactly one surface — a
+  catalog `provider` or an explicit `endpoint`; an entry naming both or
+  neither is refused. `upstreamModel` (default: `model`) is the id the
+  upstream call receives and `auth` (default `none`) is the mechanism
+  the lease must answer — `none`, `api-key`, `bearer`,
+  `cloud:<service>` or `external:<client>`. A malformed entry refuses
+  startup rather than running half a table.
+- A `provider` entry binds a catalog profile: `protocol` and `region`
+  pin the profile's surface, and the profile must accept `auth`.
+- An `endpoint` entry binds a vendor the catalog does not carry, purely
+  by configuration. `endpoint.protocol` (required) is any protocol label
+  — `openai-chat-completions`, `openai-responses`, `anthropic-messages`,
+  `gemini-generate-content`, `bedrock-converse`, or `other:<name>` for a
+  protocol with a registered adapter (`other:ollama`, `other:cohere`).
+  `endpoint.baseUrl` (required) is the base the protocol's adapter joins
+  its paths onto — `…/v1` for the OpenAI families (`chat/completions`,
+  `responses`), the host root for `anthropic-messages` (`v1/messages`).
+  It must be `http(s)` with a host and no embedded credentials, query or
+  fragment, and it keeps a4mp's cleartext policy for profile endpoints:
+  `https` anywhere; `http` only to `localhost`, `*.localhost`,
+  `*.internal` or a loopback/private/link-local IP; and with any
+  `auth` but `none`, `http` only to a private/loopback IP literal or
+  `localhost`/`*.localhost`. The entry takes no top-level `protocol`,
+  `region` or `vars`.
+- `authHeader` (endpoint entries only, optional) declares the header the
+  vendor expects the credential in. a4mp's adapter for the protocol owns
+  placement — `authorization` (`Bearer`) for the OpenAI families,
+  Bedrock, Ollama and Cohere and for `bearer` everywhere; `x-api-key`
+  for `api-key` over `anthropic-messages`; `x-goog-api-key` for
+  `api-key` over `gemini-generate-content` — so a header other than that
+  placement, or any header with `auth: none`, is refused rather than
+  sending the credential somewhere else.
+- `models.list` renders a provider entry with `provider` and `protocol`,
+  and an endpoint entry with `endpoint` (the base URL's host and port,
+  never its path), `protocol` and `authHeader` — both with `auth`,
+  `upstreamModel` and `bound`. Endpoint routes meter under the
+  `custom` provider namespace.
 - `routes[].vars` (default `{}`) supplies the profile's runtime
   variables — `{name}` placeholders in its service target. Local
   profiles carry no built-in address: their endpoint is supplied here

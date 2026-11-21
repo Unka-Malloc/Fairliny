@@ -1,6 +1,7 @@
 //! The outward face under test: the NDJSON loop, the route binding, the
-//! metering composition, and the lease's epoch contract — all against a
-//! stub adapter, so nothing here ever touches a real provider.
+//! metering composition, and the lease's epoch contract — against stub
+//! adapters or a loopback mock upstream, so nothing here ever touches a
+//! real provider.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -9,7 +10,7 @@ use std::time::Duration;
 use credential_lease::{CredentialHandoff, LeaseEpochSource, LeasedCredential, SecretBytes};
 use fairliny_gateway::leases::{Leases, ProviderCredential};
 use fairliny_gateway::meter::Meter;
-use fairliny_gateway::router::{Route, Router};
+use fairliny_gateway::router::{Access, Route, Router};
 use fairliny_gateway::service::Service;
 
 /// An epoch source a test can rotate — the contract the custody owner
@@ -869,12 +870,14 @@ fn a_route_naming_an_unknown_provider_fails_closed() {
     let resolver: Arc<dyn a4mp::CredentialResolver> = Arc::new(Leases::disconnected());
     let mut router = Router::new(Arc::new(a4mp::ReqwestTransport::new()), resolver);
     let route = Route {
-        provider: a4mp::ProviderId::new("no-such-provider"),
-        protocol: None,
-        region: None,
+        access: Access::Profile {
+            provider: a4mp::ProviderId::new("no-such-provider"),
+            protocol: None,
+            region: None,
+            vars: Default::default(),
+        },
         auth: a4mp::AuthKind::ApiKey,
         upstream_model: "x".to_owned(),
-        vars: Default::default(),
     };
     let error = router.add_route("model", route).expect_err("closed");
     assert!(error.to_string().contains("unknown provider"));
@@ -1361,4 +1364,267 @@ async fn a_cancelled_request_finishing_late_never_releases_a_reused_id() {
         driver
     );
     served.expect("serve loop");
+}
+
+/// One request a loopback mock upstream received.
+struct Received {
+    request_line: String,
+    headers: Vec<(String, String)>,
+    body: serde_json::Value,
+}
+
+impl Received {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// A loopback HTTP upstream answering exactly one request with `reply`
+/// as JSON; the join handle yields what it received. Bound to
+/// `127.0.0.1` only — no external network.
+fn mock_upstream(
+    reply: serde_json::Value,
+) -> (std::net::SocketAddr, std::thread::JoinHandle<Received>) {
+    use std::io::{BufRead, Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("addr");
+    let handle = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).expect("request line");
+        let mut headers = Vec::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("header line");
+            let line = line.trim_end();
+            if line.is_empty() {
+                break;
+            }
+            let (key, value) = line.split_once(':').expect("header");
+            headers.push((key.trim().to_owned(), value.trim().to_owned()));
+        }
+        let length: usize = headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+            .map(|(_, value)| value.parse().expect("length"))
+            .unwrap_or(0);
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).expect("body");
+        let payload = reply.to_string();
+        let mut stream = stream;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+            payload.len()
+        )
+        .expect("reply");
+        Received {
+            request_line: request_line.trim_end().to_owned(),
+            headers,
+            body: serde_json::from_slice(&body).expect("request json"),
+        }
+    });
+    (addr, handle)
+}
+
+/// A real transport that never consults proxy settings, so loopback
+/// traffic stays on the loopback interface whatever the environment.
+fn loopback_transport() -> Arc<dyn a4mp::Transport> {
+    Arc::new(a4mp::ReqwestTransport::with_client(
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client"),
+    ))
+}
+
+/// The canned OpenAI chat-completions answer.
+fn openai_reply() -> serde_json::Value {
+    serde_json::json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "vendor-model-1",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "pong"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+    })
+}
+
+/// Load one endpoint route whose base URL is the mock upstream plus
+/// `base_path` into a lease-backed router, serve `models.list` then one
+/// `chat.complete` for it, and return the replies plus what the upstream
+/// received.
+async fn serve_endpoint_route(
+    route: serde_json::Value,
+    base_path: &str,
+    reply: serde_json::Value,
+) -> (Vec<serde_json::Value>, Received) {
+    let (addr, upstream) = mock_upstream(reply);
+    let mut route = route;
+    route["endpoint"]["baseUrl"] = format!("http://{addr}{base_path}").into();
+    let mut router = Router::new(loopback_transport(), resolver_with_lease());
+    router
+        .load_routes(&serde_json::json!({ "routes": [route] }))
+        .expect("endpoint route declares");
+    let service = Service::new(router, Meter::unmetered());
+    let body = serde_json::json!({
+        "model": "vendor-chat",
+        "messages": [{"role": "user", "content": "ping"}]
+    });
+    let mut input = request_line(1, "models.list", serde_json::json!({}));
+    input.extend(request_line(2, "chat.complete", chat_params(body, None)));
+    let replies = run(&service, &input).await;
+    (replies, upstream.join().expect("upstream thread"))
+}
+
+#[tokio::test]
+async fn an_endpoint_route_forwards_to_an_uncatalogued_vendor() {
+    let (replies, received) = serve_endpoint_route(
+        serde_json::json!({
+            "model": "vendor-chat",
+            "endpoint": {"protocol": "openai-chat-completions"},
+            "auth": "api-key",
+            "authHeader": "authorization",
+            "upstreamModel": "vendor-model-1"
+        }),
+        "/v1",
+        openai_reply(),
+    )
+    .await;
+
+    // The upstream saw the protocol path under the declared base, the
+    // rewritten model and the leased key in a4mp's placement.
+    assert_eq!(received.request_line, "POST /v1/chat/completions HTTP/1.1");
+    assert_eq!(received.body["model"], "vendor-model-1");
+    assert_eq!(
+        received.header("authorization"),
+        Some("Bearer test-credential-material")
+    );
+
+    let listed = reply_for(&replies, 1);
+    let entry = &listed["result"]["models"][0];
+    assert_eq!(entry["id"], "vendor-chat");
+    assert_eq!(entry["protocol"], "openai-chat-completions");
+    assert_eq!(entry["auth"], "api-key");
+    assert_eq!(entry["authHeader"], "authorization");
+    assert!(
+        entry["endpoint"]
+            .as_str()
+            .expect("endpoint")
+            .starts_with("127.0.0.1:")
+    );
+    assert!(entry.get("provider").is_none(), "{entry}");
+    // No projection or reply ever carries the secret.
+    for reply in &replies {
+        assert!(
+            !reply.to_string().contains("test-credential-material"),
+            "{reply}"
+        );
+    }
+
+    let answer = reply_for(&replies, 2);
+    assert_eq!(
+        answer["result"]["body"]["choices"][0]["message"]["content"], "pong",
+        "{answer}"
+    );
+}
+
+#[tokio::test]
+async fn an_endpoint_route_speaks_the_declared_protocol_family() {
+    let (replies, received) = serve_endpoint_route(
+        serde_json::json!({
+            "model": "vendor-chat",
+            "endpoint": {"protocol": "anthropic-messages"},
+            "auth": "api-key",
+            "authHeader": "x-api-key",
+            "upstreamModel": "vendor-messages-1"
+        }),
+        // a4mp's Messages adapter joins `v1/messages` onto the base.
+        "",
+        serde_json::json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "vendor-messages-1",
+            "content": [{"type": "text", "text": "pong"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 3, "output_tokens": 1}
+        }),
+    )
+    .await;
+
+    // An OpenAI-dialect caller reaches an Anthropic-protocol vendor: the
+    // adapter speaks Messages and carries the key as `x-api-key`.
+    assert_eq!(received.request_line, "POST /v1/messages HTTP/1.1");
+    assert_eq!(received.body["model"], "vendor-messages-1");
+    assert_eq!(
+        received.header("x-api-key"),
+        Some("test-credential-material")
+    );
+    assert_eq!(received.header("authorization"), None);
+    let answer = reply_for(&replies, 2);
+    assert_eq!(
+        answer["result"]["body"]["choices"][0]["message"]["content"], "pong",
+        "{answer}"
+    );
+}
+
+#[test]
+fn the_binary_serves_an_endpoint_route_from_its_config() {
+    let (addr, upstream) = mock_upstream(openai_reply());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dir.path().join("routes.json");
+    let routes = serde_json::json!({"routes": [{
+        "model": "vendor-chat",
+        "endpoint": {"baseUrl": format!("http://{addr}/v1"), "protocol": "openai-chat-completions"},
+        "upstreamModel": "vendor-model-1"
+    }]});
+    std::fs::write(&config, routes.to_string()).expect("config");
+    let body = serde_json::json!({
+        "model": "vendor-chat",
+        "messages": [{"role": "user", "content": "ping"}]
+    });
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_fairliny"))
+        .args(["serve", "--no-meter", "--config"])
+        .arg(&config)
+        // The sidecar's transport honors proxy settings; loopback traffic
+        // must not leave through one.
+        .env_remove("HTTP_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("ALL_PROXY")
+        .env_remove("all_proxy")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn fairliny");
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().expect("stdin");
+        stdin
+            .write_all(&request_line(1, "chat.complete", chat_params(body, None)))
+            .expect("request line");
+    }
+    let output = child.wait_with_output().expect("exit");
+    let received = upstream.join().expect("upstream thread");
+    assert_eq!(received.body["model"], "vendor-model-1");
+    assert_eq!(received.header("authorization"), None);
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    let reply: serde_json::Value =
+        serde_json::from_str(stdout.lines().next().expect("reply line")).expect("reply json");
+    assert_eq!(reply["id"], 1);
+    assert_eq!(
+        reply["result"]["body"]["choices"][0]["message"]["content"], "pong",
+        "{reply}"
+    );
 }

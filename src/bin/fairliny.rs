@@ -6,7 +6,8 @@
 //! sockets, the custody, and the epoch file it rotates to revoke.
 //!
 //! The routes document is `{"upstreamDeadlineSecs"?,
-//! "routes":[{model,provider,upstreamModel?,protocol?,region?,auth?,vars?}]}` —
+//! "routes":[{model,provider,upstreamModel?,protocol?,region?,auth?,vars?}
+//! | {model,endpoint:{baseUrl,protocol},upstreamModel?,auth?,authHeader?}]}` —
 //! the deadline bounds one upstream call when the host sets it (`0` or
 //! absent waits unbounded — the caller cancels; the sidecar never
 //! self-times-out viable work), and a malformed entry refuses startup

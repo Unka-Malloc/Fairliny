@@ -52,7 +52,10 @@ JSON reply per stdout line.
   `FAIRLINY_EPOCH_FILE` names the file the custody owner rewrites on
   epoch rotation; without it the lease resolves but revocation has no
   channel.
-- A malformed route entry refuses startup rather than running half a
+- A route entry names a catalog `provider` or an explicit
+  `endpoint: {baseUrl, protocol}` (with optional `authHeader`), never
+  both — any vendor the catalog lacks is declared that way. A malformed
+  route entry refuses startup rather than running half a
   route table; unknown models and unaccepted auth mechanisms fail
   closed.
 - `upstreamDeadlineSecs` in the routes document is the host's opt-in

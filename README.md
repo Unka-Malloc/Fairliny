@@ -5,7 +5,8 @@ credential leases (Credential-Lease) into one outward model-service face;
 a forwarding-only core with Metera usage metering composed in.
 
 A caller names a model; the router binds the configured provider profile
-to a live a4mp adapter; the lease port answers credentials from a
+— or an explicit endpoint the host declares outside the catalog — to a
+live a4mp adapter; the lease port answers credentials from a
 process-bound `CredentialLease`; the response forwards back untouched.
 Metering runs beside that path — one admission counter and one settlement
 hook — never inside it.
@@ -33,7 +34,7 @@ hook — never inside it.
 
 | Module | Owns |
 | --- | --- |
-| `router` | Outward model names bound to provider access surfaces: catalog profile, protocol target, auth mechanism, upstream model id. Unknown models and unaccepted auth fail closed. |
+| `router` | Outward model names bound to provider access surfaces — a catalog profile or an explicit endpoint (base URL + protocol) — with an auth mechanism and upstream model id. Unknown models, unaccepted auth and cleartext credential paths fail closed. |
 | `leases` | The credential custody port: the `ProviderCredential` kind family, the process-bound `CredentialSlot`, `FileEpochSource` for custody-driven revocation, and a4mp's `CredentialResolver`. |
 | `meter` | Metera composed in: bounded per-day agent×model request counters (`GatewayUsageRecorder`-shaped), and response settlement — `ProviderMapping` → `SourceBinding` → `UsageSourcePort` — into the usage journal. |
 | `export` | Prometheus/OpenMetrics text from `agent-statistics::export` for a host-mounted scrape route. |
@@ -60,8 +61,13 @@ requests may interleave — correlate by `id`. `upstreamDeadlineSecs`
 absent or `0` waits unbounded — the caller cancels; a positive value
 bounds one upstream call.
 
-- `--config` / `FAIRLINY_CONFIG` — routes document:
-  `{"routes":[{"model":"chat","provider":"openai","upstreamModel":"gpt-4o-mini","protocol":"openai-chat-completions","auth":"api-key"}]}`
+- `--config` / `FAIRLINY_CONFIG` — routes document. Each entry names
+  exactly one surface — a catalog `provider` or an explicit `endpoint`;
+  both or neither refuses startup:
+  `{"routes":[{"model":"chat","provider":"openai","upstreamModel":"gpt-4o-mini","protocol":"openai-chat-completions","auth":"api-key"},`
+  `{"model":"vendor","endpoint":{"baseUrl":"https://api.vendor.example/v1","protocol":"openai-chat-completions"},"auth":"api-key","authHeader":"authorization","upstreamModel":"vendor-large"}]}`
+  — see [integration modes](docs/integration-modes.md) for the full
+  schema.
 - `--state-root` / `FAIRLINY_STATE_ROOT` — the metering data home
   (default `~/.fairliny`, else `fairliny` under `XDG_STATE_HOME` or
   `LOCALAPPDATA`; never the working directory — with no absolute base

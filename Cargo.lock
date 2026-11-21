@@ -328,6 +328,7 @@ dependencies = [
  "collection-store",
  "credential-lease",
  "futures-core",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

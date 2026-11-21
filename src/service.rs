@@ -6,8 +6,8 @@
 //! a sidecar survives bad input rather than dying on it. Methods:
 //!
 //! - `models.list` — the bound route table. Configured surfaces, never a
-//!   live-availability claim: a profile's presence asserts a supported
-//!   access surface, not that the provider is reachable now.
+//!   live-availability claim: a profile's or endpoint's presence asserts
+//!   a supported access surface, not that the provider is reachable now.
 //! - `chat.complete` — forward one `{dialect, body, agent?}` chat request
 //!   through the wire codecs and the bound adapter; the result is
 //!   `{body, losses}` — the dialect response plus every conversion loss.
@@ -36,7 +36,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWr
 use tokio::task::JoinSet;
 
 use crate::meter::Meter;
-use crate::router::{BoundRoute, Router, auth_label, protocol_label};
+use crate::router::{Access, BoundRoute, Router, auth_label, endpoint_authority, protocol_label};
 use crate::{Error, Result};
 
 /// Upper bound on one request line. A line past it is hostile input, not
@@ -461,14 +461,34 @@ impl Service {
     fn models_list(&self) -> Result<Value> {
         let mut models = Vec::new();
         for (model, route) in self.router.routes() {
-            models.push(json!({
+            let mut entry = json!({
                 "id": model,
-                "provider": route.provider.as_str(),
                 "upstreamModel": route.upstream_model,
-                "protocol": route.protocol.as_ref().map(protocol_label),
                 "auth": auth_label(&route.auth),
                 "bound": "route",
-            }));
+            });
+            match &route.access {
+                Access::Profile {
+                    provider, protocol, ..
+                } => {
+                    entry["provider"] = provider.as_str().into();
+                    entry["protocol"] = protocol.as_ref().map(protocol_label).into();
+                }
+                // The endpoint shows its authority only: the base URL
+                // carries no credentials and its path stays private.
+                Access::Endpoint {
+                    base_url,
+                    protocol,
+                    auth_header,
+                } => {
+                    entry["endpoint"] = endpoint_authority(base_url).into();
+                    entry["protocol"] = protocol_label(protocol).into();
+                    if let Some(header) = auth_header {
+                        entry["authHeader"] = header.as_str().into();
+                    }
+                }
+            }
+            models.push(entry);
         }
         for (model, adapter, upstream_model) in self.router.prebound() {
             models.push(json!({
