@@ -1,7 +1,7 @@
 # Integration modes
 
 Two ways to consume the gateway, one semantics. A Rust host embeds the
-`fairliny` crate and composes the router, the lease port and the meter
+`fairliny-gateway` crate and composes the router, the lease port and the meter
 itself; a host in any other language spawns `fairliny serve` and speaks
 one JSON object per line over stdio — both paths land on the same
 `Service::dispatch`.
@@ -10,7 +10,7 @@ one JSON object per line over stdio — both paths land on the same
 
 ```toml
 [dependencies]
-fairliny = "0.1"
+fairliny-gateway = "0.1"
 ```
 
 ```rust

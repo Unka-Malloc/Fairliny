@@ -5,7 +5,7 @@ description: Embed the fairliny gateway in a Rust host — credential leases in 
 
 # fairliny SDK mode
 
-Embed `fairliny` and compose the outward model-service face in-process.
+Embed `fairliny-gateway` and compose the outward model-service face in-process.
 
 ## When to use
 
