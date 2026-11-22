@@ -27,7 +27,7 @@ use a4mp::{
 use serde_json::Value;
 use url::Url;
 
-use crate::leases::{Leases, ProviderCredential, ScopeOwner};
+use crate::leases::{Leases, ProviderCredential, ScopeOwner, ScopedResolver};
 use crate::{Error, Result};
 
 /// The provider id endpoint routes bind under. An endpoint route names no
@@ -290,6 +290,10 @@ pub struct BoundRoute {
 /// adapter-side credential cache to go stale.
 pub struct Router {
     client: a4mp::Client,
+    /// The shared transport, kept so a scoped route's adapter binds
+    /// through the catalog with its pinned-scope resolver rather than
+    /// the bare port.
+    transport: Arc<dyn Transport>,
     routes: BTreeMap<String, Route>,
     /// Vendors the catalog does not carry, bound by explicit endpoint.
     endpoint_routes: BTreeMap<String, EndpointRoute>,
@@ -336,7 +340,8 @@ impl Router {
         resolver: Arc<dyn CredentialResolver>,
     ) -> Self {
         Self {
-            client: a4mp::Client::new(catalog, transport, resolver),
+            client: a4mp::Client::new(catalog, transport.clone(), resolver),
+            transport,
             routes: BTreeMap::new(),
             endpoint_routes: BTreeMap::new(),
             scopes: BTreeMap::new(),
@@ -379,9 +384,11 @@ impl Router {
     /// protocol is refused before traffic ever reaches the route, not at
     /// first `chat.complete`.
     ///
-    /// An `api-key`/`bearer` route must name its credential scope —
-    /// [`Router::add_route_scoped`] — so a leased credential can never
-    /// ride a surface the host did not authorize for it.
+    /// On the lease port an `api-key`/`bearer` route must name its
+    /// credential scope — [`Router::add_route_scoped`] — so a leased
+    /// credential can never ride a surface the host did not authorize
+    /// for it. A host-supplied resolver owns its custody instead: the
+    /// same mechanisms declare unscoped here and resolve through it.
     pub fn add_route(&mut self, model: impl Into<String>, route: Route) -> Result<()> {
         self.add_profile(model.into(), route, None)
     }
@@ -409,8 +416,9 @@ impl Router {
     /// access the custody port cannot answer — and a declared
     /// `auth_header` must be where a4mp places the credential.
     ///
-    /// An `api-key`/`bearer` route must name its credential scope —
-    /// [`Router::add_endpoint_route_scoped`].
+    /// On the lease port an `api-key`/`bearer` route must name its
+    /// credential scope — [`Router::add_endpoint_route_scoped`]; a
+    /// host-supplied resolver declares them unscoped instead.
     pub fn add_endpoint_route(
         &mut self,
         model: impl Into<String>,
@@ -490,7 +498,7 @@ impl Router {
             model: model.to_owned(),
             reason,
         };
-        check_credential_scope(&route.auth, scope).map_err(refuse)?;
+        check_credential_scope(&route.auth, scope, self.leases.is_some()).map_err(refuse)?;
         // A mechanism the resolver can never answer binds fine at
         // startup and then fails every forward — on the lease port that
         // is everything outside the leased kinds, so it refuses here
@@ -559,7 +567,7 @@ impl Router {
             model: model.to_owned(),
             reason,
         };
-        check_credential_scope(&route.auth, scope).map_err(refuse)?;
+        check_credential_scope(&route.auth, scope, self.leases.is_some()).map_err(refuse)?;
         if !matches!(route.auth, AuthKind::None)
             && ProviderCredential::for_auth(&route.auth).is_none()
         {
@@ -854,20 +862,59 @@ impl Router {
             reason,
         };
         if let Some(route) = self.routes.get(model) {
+            let adapter = match self.scopes.get(model) {
+                Some(binding) => self.bind_scoped(&route.auth, binding).map_err(refused)?,
+                None => self.bind_profile(route).map_err(refused)?,
+            };
             return Ok(BoundRoute {
-                adapter: self.bind_profile(route).map_err(refused)?,
+                adapter,
                 upstream_model: route.upstream_model.clone(),
                 provider: route.provider.clone(),
             });
         }
         if let Some(route) = self.endpoint_routes.get(model) {
+            let adapter = match self.scopes.get(model) {
+                Some(binding) => self.bind_scoped(&route.auth, binding).map_err(refused)?,
+                None => self.bind_endpoint(route).map_err(refused)?,
+            };
             return Ok(BoundRoute {
-                adapter: self.bind_endpoint(route).map_err(refused)?,
+                adapter,
                 upstream_model: route.upstream_model.clone(),
                 provider: ProviderId::new(CUSTOM_PROVIDER),
             });
         }
         Err(Error::UnknownModel(model.to_owned()))
+    }
+
+    /// The scoped-route bind: the adapter goes up on the surface the
+    /// declaration registered, through a resolver pinned to the scope
+    /// the route declared. An adapter a later rebind detaches keeps
+    /// resolving against its own declaration — a rebound surface fails
+    /// it closed instead of handing it another scope's credentials.
+    /// The stored target already passed every declaration check, so
+    /// only the protocol-family bind remains.
+    fn bind_scoped(
+        &self,
+        auth: &AuthKind,
+        binding: &ScopedBinding,
+    ) -> std::result::Result<Arc<dyn Adapter>, String> {
+        let Some(leases) = &self.leases else {
+            return Err("credential scope requires the lease port".to_owned());
+        };
+        let resolver: Arc<dyn CredentialResolver> = Arc::new(ScopedResolver::new(
+            Arc::clone(leases),
+            binding.scope.clone(),
+        ));
+        self.client
+            .catalog()
+            .bind(
+                binding.target.clone(),
+                auth.clone(),
+                Arc::clone(&self.transport),
+                resolver,
+                None,
+            )
+            .map_err(|error| error.to_string())
     }
 
     /// The profile bind both declaration and resolution run.
@@ -904,18 +951,36 @@ impl Router {
     }
 }
 
+impl Drop for Router {
+    /// Retire this router's published bindings: a router sharing its
+    /// lease port must not hold surfaces past its own lifetime, so the
+    /// drop republishes an empty slice. The retired bindings keep their
+    /// tombstones — a replacement router can bind the freed surfaces
+    /// while adapters the drop detached keep failing closed.
+    fn drop(&mut self) {
+        if let Some(leases) = &self.leases {
+            let _ = leases.replace_target_scopes(self.scope_owner, std::iter::empty());
+        }
+    }
+}
+
 /// The credential-scope contract for one declared route: a scope binds
-/// to a leased auth mechanism (`api-key`/`bearer`) — required for them,
-/// meaningless and refused for anything else.
+/// to a leased auth mechanism (`api-key`/`bearer`) — required for them
+/// when the router is lease-backed, meaningless and refused for
+/// anything else. A host-supplied resolver owns its credential
+/// dispatch, so the leased mechanisms declare unscoped there; a scope
+/// declared without the port that enforces it still refuses, in
+/// [`Router::check_scope_resolver`].
 fn check_credential_scope(
     auth: &AuthKind,
     scope: &Option<String>,
+    lease_backed: bool,
 ) -> std::result::Result<(), String> {
     match (
         ProviderCredential::for_auth(auth).is_some(),
         scope.as_deref().filter(|scope| !scope.is_empty()),
     ) {
-        (true, None) => Err(format!(
+        (true, None) if lease_backed => Err(format!(
             "{} requires a credential scope: the host authorizes which \
              leased credentials a route may resolve",
             auth_label(auth)

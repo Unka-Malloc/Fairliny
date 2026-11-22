@@ -16,7 +16,10 @@
 //! a scope holding none fails closed rather than borrowing another
 //! vendor's key. Routers sharing this port publish their bindings under
 //! their own [`ScopeOwner`] — one router's whole-table publish retires
-//! only its own slice, never another router's live bindings.
+//! only its own slice, never another router's live bindings — and a
+//! dropped router's slice retires with it, tombstoned so the adapters
+//! it detached fail closed while a replacement can bind the freed
+//! surfaces.
 //!
 //! Secret bytes never leave this module except through a4mp's redacted
 //! `Secret`/`Credential` boundary types. Errors carry the lease contract's
@@ -550,9 +553,11 @@ fn validate_scope(
 /// and nothing else, under the install's epoch source wrapped in
 /// [`DeadlineEpoch`] so the minted lease dies at `deadline` — the
 /// install's own expiry — however much duration the document itself
-/// still claims. Below the contract's one-second minimum no lease can
-/// mint: the install's expiry has effectively arrived, so the scope
-/// stays disconnected and resolves unavailable.
+/// still claims. Any positive remaining duration mints: the document's
+/// own duration satisfies the contract's whole-second minimum and the
+/// deadline wrapper holds the absolute end, so a scope authorized with
+/// less than a second left still resolves until the install expires.
+/// Only a deadline already reached leaves the slot disconnected.
 fn scoped_slot(
     document: &[u8],
     ids: &BTreeSet<String>,
@@ -561,7 +566,7 @@ fn scoped_slot(
 ) -> Result<CredentialSlot<ProviderCredential>> {
     let slot = CredentialSlot::disconnected();
     let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.as_secs() >= 1 {
+    if !remaining.is_zero() {
         let mut handoff = CredentialHandoff::<ProviderCredential>::from_json(document)
             .map_err(|error| Error::Credential(error.to_string()))?;
         handoff.retain_credential_ids(ids);
@@ -600,26 +605,114 @@ fn target_key(target: &ServiceTarget) -> String {
     )
 }
 
+/// A credential resolver pinned to the scope an adapter's surface was
+/// declared against.
+///
+/// The router binds a scoped route's adapter with this resolver instead
+/// of the bare port: the adapter resolves only while the surface still
+/// names the scope it was declared with. A rebind — the surface now
+/// serving another scope — or a retired binding fails it closed, so an
+/// adapter a route replacement detached can never inherit credentials
+/// the new declaration authorized for a different scope.
+pub struct ScopedResolver {
+    leases: Arc<Leases>,
+    scope: String,
+}
+
+impl ScopedResolver {
+    /// Pin resolutions to `scope` — the credential scope the bound
+    /// surface must still name for the adapter to resolve.
+    pub fn new(leases: Arc<Leases>, scope: impl Into<String>) -> Self {
+        Self {
+            leases,
+            scope: scope.into(),
+        }
+    }
+}
+
 #[async_trait::async_trait]
-impl CredentialResolver for Leases {
-    /// Resolve request-time material for the adapter's scope. Resolution
-    /// goes through the slot on every call: the lease's own expiry and the
-    /// custody epoch are consulted each time, so a revoked lease fails the
-    /// very next forward rather than finishing one more request.
-    ///
-    /// A surface the router registered against a credential scope
-    /// resolves only from that scope's slot — the credentials the host
-    /// authorized for it — and fails closed when the scope holds none,
-    /// when two owners bound the surface to different scopes, or when
-    /// every binding for it retired: an adapter detached by a republish
-    /// never slips back to the unscoped slot its scope once guarded it
-    /// from. Never-bound surfaces answer from the unscoped slot. One absolute
-    /// expiry covers every slot the install produced: past the install's
-    /// deadline the answer is `credential_lease_expired`, so a scope
-    /// materialized late can never outlive the handoff it came from.
+impl CredentialResolver for ScopedResolver {
     async fn resolve(
         &self,
         scope: CredentialScope<'_>,
+    ) -> std::result::Result<Credential, a4mp::Error> {
+        self.leases.resolve_pinned(&self.scope, scope)
+    }
+}
+
+impl Leases {
+    /// The live scope one surface's bindings name across every owner's
+    /// table: `None` when no live binding claims it, `Some(scope)` when
+    /// exactly one does. A tombstoned surface with no live claim refuses
+    /// `credential_scope_retired` rather than falling back to the
+    /// unscoped slot, and two owners naming different scopes refuse
+    /// `credential_scope_conflict` — resolution could never tell them
+    /// apart.
+    fn bound_scope(
+        &self,
+        target: &ServiceTarget,
+    ) -> std::result::Result<Option<String>, a4mp::Error> {
+        let tables = lock(&self.target_scopes);
+        let key = target_key(target);
+        let mut found = BTreeSet::new();
+        let mut retired = false;
+        for table in tables.values() {
+            match table.get(&key) {
+                Some(Some(scope)) => {
+                    found.insert(scope.clone());
+                }
+                Some(None) => retired = true,
+                None => {}
+            }
+        }
+        match found.len() {
+            0 if retired => Err(a4mp::Error::Credential(
+                "credential_scope_retired".to_owned(),
+            )),
+            0 => Ok(None),
+            1 => Ok(found.pop_first()),
+            _ => Err(a4mp::Error::Credential(
+                "credential_scope_conflict".to_owned(),
+            )),
+        }
+    }
+
+    /// The pinned half of resolution: the surface must still name
+    /// `declared` — the scope the adapter was bound against. A surface
+    /// rebound to another scope or retired altogether fails closed; an
+    /// adapter detached by the rebind can never inherit credentials its
+    /// declaration did not authorize.
+    fn resolve_pinned(
+        &self,
+        declared: &str,
+        scope: CredentialScope<'_>,
+    ) -> std::result::Result<Credential, a4mp::Error> {
+        let scoped = match self.bound_scope(scope.target)? {
+            Some(bound) if bound == declared => Some(bound),
+            Some(_) => {
+                return Err(a4mp::Error::Credential(
+                    "credential_scope_conflict".to_owned(),
+                ));
+            }
+            None => {
+                return Err(a4mp::Error::Credential(
+                    "credential_scope_retired".to_owned(),
+                ));
+            }
+        };
+        self.resolve_kind(scoped, &scope)
+    }
+
+    /// The shared tail of every resolution: the leased-kind check, the
+    /// install-wide deadline and the slot the binding dispatch picked.
+    /// One absolute expiry covers every slot the install produced: past
+    /// the install's deadline the answer is `credential_lease_expired`,
+    /// so a scope materialized late can never outlive the handoff it
+    /// came from.
+    fn resolve_kind(
+        &self,
+        scoped: Option<String>,
+        scope: &CredentialScope<'_>,
     ) -> std::result::Result<Credential, a4mp::Error> {
         let invalid = |error: &dyn fmt::Display| a4mp::Error::Credential(error.to_string());
         if matches!(scope.auth, AuthKind::None) {
@@ -629,35 +722,6 @@ impl CredentialResolver for Leases {
             return Err(a4mp::Error::Credential(
                 "credential_lease_kind_not_leased".to_owned(),
             ));
-        };
-        let scoped = {
-            let tables = lock(&self.target_scopes);
-            let key = target_key(scope.target);
-            let mut found = BTreeSet::new();
-            let mut retired = false;
-            for table in tables.values() {
-                match table.get(&key) {
-                    Some(Some(scope)) => {
-                        found.insert(scope.clone());
-                    }
-                    Some(None) => retired = true,
-                    None => {}
-                }
-            }
-            match found.len() {
-                0 if retired => {
-                    return Err(a4mp::Error::Credential(
-                        "credential_scope_retired".to_owned(),
-                    ));
-                }
-                0 => None,
-                1 => found.pop_first(),
-                _ => {
-                    return Err(a4mp::Error::Credential(
-                        "credential_scope_conflict".to_owned(),
-                    ));
-                }
-            }
         };
         let state = lock(&self.state);
         if state.epoch_source.is_some() && Instant::now() >= state.expires_at {
@@ -685,5 +749,31 @@ impl CredentialResolver for Leases {
                 expires_at: None,
             },
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl CredentialResolver for Leases {
+    /// Resolve request-time material for the adapter's scope. Resolution
+    /// goes through the slot on every call: the lease's own expiry and the
+    /// custody epoch are consulted each time, so a revoked lease fails the
+    /// very next forward rather than finishing one more request.
+    ///
+    /// A surface the router registered against a credential scope
+    /// resolves only from that scope's slot — the credentials the host
+    /// authorized for it — and fails closed when the scope holds none,
+    /// when two owners bound the surface to different scopes, or when
+    /// every binding for it retired: an adapter detached by a republish
+    /// never slips back to the unscoped slot its scope once guarded it
+    /// from. Never-bound surfaces answer from the unscoped slot. One absolute
+    /// expiry covers every slot the install produced: past the install's
+    /// deadline the answer is `credential_lease_expired`, so a scope
+    /// materialized late can never outlive the handoff it came from.
+    async fn resolve(
+        &self,
+        scope: CredentialScope<'_>,
+    ) -> std::result::Result<Credential, a4mp::Error> {
+        let scoped = self.bound_scope(scope.target)?;
+        self.resolve_kind(scoped, &scope)
     }
 }
