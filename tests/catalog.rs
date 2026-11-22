@@ -190,8 +190,16 @@ async fn providers_list_projects_all_eighteen_base_vendors() {
         "{google}"
     );
 
+    // Every entry names its canonical route provider — the profile id a
+    // routes document binds; discovery keys may be aliases.
+    for (id, profile_id) in BASE_VENDORS {
+        assert_eq!(vendors[*id]["provider"], *profile_id, "{id}");
+    }
+
     // Amazon Nova binds through Bedrock's SigV4 surface: the converse
-    // protocol and a cloud-identity mechanism.
+    // protocol, the canonical `amazon-bedrock` provider and the
+    // `cloud:aws` mechanism marked as host-resolved — the lease port
+    // cannot answer it.
     let nova = &vendors["amazon-nova"];
     assert!(
         nova["endpoints"]
@@ -201,14 +209,25 @@ async fn providers_list_projects_all_eighteen_base_vendors() {
             .any(|endpoint| endpoint["protocol"] == "bedrock-converse"),
         "{nova}"
     );
-    assert!(
-        nova["auth"]
-            .as_array()
-            .expect("auth")
-            .iter()
-            .any(|mechanism| mechanism == "cloud-identity"),
-        "{nova}"
-    );
+    assert_eq!(nova["provider"], "amazon-bedrock", "{nova}");
+    let mechanisms: Vec<&str> = nova["auth"]
+        .as_array()
+        .expect("auth")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(mechanisms.contains(&"cloud:aws"), "{nova}");
+    // Every emitted mechanism parses as a route `auth` value.
+    for mechanism in &mechanisms {
+        fairliny_gateway::router::parse_auth(mechanism).expect(mechanism);
+    }
+    let host_resolver: Vec<&str> = nova["hostResolver"]
+        .as_array()
+        .expect("hostResolver")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(host_resolver, ["cloud:aws"], "{nova}");
 
     // Kimi carries both regional choices.
     let regions: BTreeSet<_> = vendors["kimi"]["endpoints"]
@@ -389,6 +408,85 @@ fn amazon_nova_binds_the_sigv4_path() {
         bound.adapter.target().base_url,
         url::Url::parse(converse_base).expect("declared url")
     );
+}
+
+#[tokio::test]
+async fn catalog_refresh_runs_beside_the_serve_loop() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    // A source that stalls the TLS handshake parks the refresh task,
+    // never the loop: an offline read still answers while the fetch is
+    // in flight, and the refresh reply still lands once the fetch ends.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let held = std::thread::spawn(move || {
+        let stream = listener.accept().expect("accept").0;
+        // Hold the socket open so the handshake stalls until released —
+        // a blocking join must never freeze the runtime thread.
+        let _ = release_rx.recv();
+        drop(stream);
+    });
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source_url = format!("https://{addr}/catalog");
+    write_cache(dir.path(), &source_url);
+    let source = CatalogSource::from_document(&json!({"source": source_url})).expect("source");
+    let sync = CatalogSync::new(dir.path())
+        .expect("sync")
+        .with_source(source)
+        .with_client(
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("client"),
+        );
+    let service = service_with(Some(sync));
+
+    let (mut requests, input) = tokio::io::duplex(4096);
+    let (output, mut replies) = tokio::io::duplex(64 * 1024);
+    let serving = tokio::spawn(async move {
+        service
+            .serve(tokio::io::BufReader::new(input), output)
+            .await
+            .expect("serve loop");
+    });
+    requests
+        .write_all(
+            b"{\"id\":1,\"method\":\"catalog.refresh\",\"params\":{}}\n\
+              {\"id\":2,\"method\":\"catalog.read\",\"params\":{}}\n",
+        )
+        .await
+        .expect("requests");
+
+    // The offline read replies while the refresh is still parked — the
+    // loop never awaited the network.
+    let mut replies = tokio::io::BufReader::new(&mut replies).lines();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(30), replies.next_line())
+        .await
+        .expect("the loop stays responsive")
+        .expect("reply line")
+        .expect("a reply");
+    let first: Value = serde_json::from_str(&first).expect("reply json");
+    assert_eq!(first["id"], 2, "{first}");
+    assert_eq!(first["result"]["status"], "cached", "{first}");
+
+    // Releasing the stalled socket ends the fetch; EOF then drains the
+    // refresh task and its reply still reaches the wire.
+    let _ = release_tx.send(());
+    drop(requests);
+    serving.await.expect("serving");
+    held.join().expect("holder");
+    let mut saw_refresh_reply = false;
+    while let Some(line) = replies.next_line().await.expect("line") {
+        let reply: Value = serde_json::from_str(&line).expect("reply json");
+        if reply["id"] == 1 {
+            assert_eq!(reply["result"]["status"], "stale", "{reply}");
+            assert_eq!(reply["result"]["catalog"]["revision"], REVISION, "{reply}");
+            saw_refresh_reply = true;
+        }
+    }
+    assert!(saw_refresh_reply, "the refresh reply lands on the wire");
 }
 
 #[tokio::test]

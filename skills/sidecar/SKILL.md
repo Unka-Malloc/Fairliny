@@ -24,10 +24,14 @@ JSON reply per stdout line.
 - `models.list` — the bound route table: configured surfaces and
   prebound adapters, never a provider discovery.
 - `providers.list` — `{vendors}`: the base-vendor directory — every
-  foundation-model profile a4mp declares, with its accepted
-  mechanisms and https endpoints (regions, Gemini's native
-  `gemini-generate-content`, Amazon Nova's Bedrock SigV4 path). A
-  discovery answer, not a reachability probe.
+  foundation-model profile a4mp declares, with its canonical route
+  `provider` (the profile id a routes document binds; discovery keys
+  may be aliases), accepted `auth` mechanisms in route spelling, and
+  https endpoints (regions, Gemini's native `gemini-generate-content`,
+  Amazon Nova's Bedrock SigV4 path). Mechanisms the lease port cannot
+  answer — `cloud:aws` SigV4 included — list under `hostResolver` and
+  need a host-supplied SDK resolver. A discovery answer, not a
+  reachability probe.
 - `catalog.read` — `{status: "empty"|"cached", catalog}`: the
   validated local copy of the configured `*.model-catalog.v1`
   document; never a network request.
@@ -36,7 +40,9 @@ JSON reply per stdout line.
   `If-None-Match` under the cached revision, `304` revalidates
   without rewriting the cache, and a failed or invalid fetch keeps
   and reports the last valid catalog. Requires the `catalog` config
-  member `{"cacheDir", "source"?, "schema"?}`; refresh is explicit —
+  member `{"cacheDir", "source"?, "schema"?}`; `schema` pins the cache
+  for offline reads too. The refresh runs beside the loop, so its
+  reply may land after later requests' replies — correlate by `id`;
   the sidecar never polls on its own timer.
 - `chat.complete` / `chat.stream` — `params` is
   `{dialect, body, agent?}`: `dialect` is one of

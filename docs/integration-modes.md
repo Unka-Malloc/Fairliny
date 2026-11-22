@@ -157,7 +157,8 @@ The routes document is one object:
   credentials, query or fragment and its absence leaves the store
   offline-only; `schema` optionally pins the exact
   `<namespace>.model-catalog.v1` marker the host expects (unconfigured,
-  any family member passes). `catalog.read` answers the local cache —
+  any family member passes) — the pin constrains offline reads the same
+  as refreshed ones. `catalog.read` answers the local cache —
   never a fetch; `catalog.refresh` runs one conditional GET per
   request — `If-None-Match` when a revision is cached, `304` answers
   `unchanged` with no write, a valid `200` replaces the cache
@@ -165,7 +166,12 @@ The routes document is one object:
   valid document. `providers.list` projects the base-vendor directory —
   the foundation-model profiles a4mp declares, including regional
   endpoints, Gemini's native `gemini-generate-content` protocol and
-  Amazon Nova's Bedrock SigV4 path — a discovery answer, not a
+  Amazon Nova's Bedrock SigV4 path. Each entry names its canonical
+  route `provider` (the profile id a routes document binds — discovery
+  keys may be aliases) and its accepted `auth` mechanisms in route
+  spelling; mechanisms the lease port cannot answer, like Bedrock's
+  `cloud:aws` SigV4 path, appear under `hostResolver` — they resolve
+  only through a host-supplied SDK resolver. A discovery answer, not a
   reachability probe.
 - A `provider` entry binds a catalog profile: `protocol` and `region`
   pin the profile's surface, and the profile must accept `auth`.

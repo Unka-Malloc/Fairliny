@@ -177,11 +177,11 @@ pub struct Service {
     settle: Arc<Mutex<JoinSet<()>>>,
     /// In-flight request claims, for `chat.cancel`.
     inflight: Arc<InFlight>,
-    /// Spawned chat tasks, reaped like the settlement set.
+    /// Spawned chat and catalog tasks, reaped like the settlement set.
     forward: Mutex<JoinSet<()>>,
     /// The configured catalog sync, when the host declared one —
     /// `catalog.read`/`catalog.refresh` answer from it.
-    catalog_sync: Option<crate::catalog::CatalogSync>,
+    catalog_sync: Option<Arc<crate::catalog::CatalogSync>>,
 }
 
 impl Service {
@@ -200,7 +200,7 @@ impl Service {
 
     /// Attach the host-configured catalog sync.
     pub fn with_catalog_sync(mut self, sync: Option<crate::catalog::CatalogSync>) -> Self {
-        self.catalog_sync = sync;
+        self.catalog_sync = sync.map(Arc::new);
         self
     }
 
@@ -351,11 +351,12 @@ impl Service {
         reply(id, result)
     }
 
-    /// The stdin loop: unary requests answer inline; chat requests run on
-    /// their own task so one slow upstream never serializes the gateway —
-    /// replies and stream frames for different requests may interleave,
-    /// correlate by `id`. EOF drains in-flight work to completion; the
-    /// sidecar cancels nothing on its own.
+    /// The stdin loop: unary requests answer inline; chat requests and
+    /// catalog refreshes run on their own tasks so one slow upstream or
+    /// source never serializes the gateway — replies and stream frames
+    /// for different requests may interleave, correlate by `id`. EOF
+    /// drains in-flight work to completion; the sidecar cancels nothing
+    /// on its own.
     pub async fn serve(
         &self,
         mut input: impl AsyncBufRead + Unpin,
@@ -442,6 +443,31 @@ impl Service {
                         });
                     }
                 }
+                Some("catalog.refresh") => match &self.catalog_sync {
+                    // The refresh is tracked background work like a
+                    // forward: a slow source never delays the next
+                    // request or a chat cancel, and the refresh reply
+                    // still lands on the wire — and drains on EOF.
+                    Some(sync) => {
+                        self.reap_forward();
+                        let sync = Arc::clone(sync);
+                        let task_writer = Arc::clone(&writer);
+                        lock(&self.forward).spawn(async move {
+                            let result = sync.refresh().await;
+                            let _ = write_line(&task_writer, &reply(id, result)).await;
+                        });
+                    }
+                    None => {
+                        write_line(
+                            &writer,
+                            &error_reply(
+                                id,
+                                &Error::Catalog("catalog_not_configured".to_owned()).to_string(),
+                            ),
+                        )
+                        .await?;
+                    }
+                },
                 other => {
                     let reply = self.dispatch(id, other, &params).await;
                     write_line(&writer, &reply).await?;

@@ -16,6 +16,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -63,17 +64,10 @@ impl CatalogSource {
             .as_str()
             .ok_or_else(|| catalog_error(SOURCE_INVALID))?;
         let url = https_url(source).ok_or_else(|| catalog_error(SOURCE_INVALID))?;
-        let schema = match document.get("schema") {
-            None | Some(Value::Null) => None,
-            Some(value) => Some(
-                value
-                    .as_str()
-                    .filter(|schema| nonblank(schema))
-                    .ok_or_else(|| catalog_error(SOURCE_INVALID))?
-                    .to_owned(),
-            ),
-        };
-        Ok(Some(Self { url, schema }))
+        Ok(Some(Self {
+            url,
+            schema: schema_pin(document)?,
+        }))
     }
 
     /// The URL the refresh fetches.
@@ -89,10 +83,13 @@ impl CatalogSource {
 }
 
 /// The synchronized catalog: a validated cache rooted at `dir`, fed by
-/// an optional configured source.
+/// an optional configured source. The schema pin stands alone from the
+/// source — an offline-only store still applies the host's pin to every
+/// cache it reads.
 pub struct CatalogSync {
     dir: PathBuf,
     source: Option<CatalogSource>,
+    schema: Option<String>,
     client: reqwest::Client,
 }
 
@@ -102,6 +99,7 @@ impl CatalogSync {
         Ok(Self {
             dir: dir.into(),
             source: None,
+            schema: None,
             client: crate::transport::upstream_client()?,
         })
     }
@@ -121,8 +119,15 @@ impl CatalogSync {
             .and_then(Value::as_str)
             .filter(|dir| !dir.trim().is_empty())
             .ok_or_else(|| catalog_error("catalog config requires a cacheDir"))?;
+        let source = CatalogSource::from_document(member)?;
+        // A present source already carries the member's pin; only a
+        // source-less member stores it on the sync itself.
+        let schema = match source.is_some() {
+            true => None,
+            false => schema_pin(member)?,
+        };
         Ok(Some(
-            Self::new(dir)?.with_source(CatalogSource::from_document(member)?),
+            Self::new(dir)?.with_source(source).with_schema(schema),
         ))
     }
 
@@ -131,6 +136,30 @@ impl CatalogSync {
     pub fn with_source(mut self, source: Option<CatalogSource>) -> Self {
         self.source = source;
         self
+    }
+
+    /// Pin the exact `<namespace>.model-catalog.v1` marker the host
+    /// expects when no source carries one — applied to offline reads
+    /// just as the source's own pin applies to refresh.
+    pub fn with_schema(mut self, schema: Option<String>) -> Self {
+        self.schema = schema;
+        self
+    }
+
+    /// The HTTP client the refresh fetches through; a host that tunes
+    /// its own reqwest settings keeps the same cache semantics.
+    pub fn with_client(mut self, client: reqwest::Client) -> Self {
+        self.client = client;
+        self
+    }
+
+    /// The schema pin the host expects: a configured source's own pin
+    /// first, else the standalone one.
+    fn pin(&self) -> Option<&str> {
+        self.source
+            .as_ref()
+            .and_then(CatalogSource::schema)
+            .or(self.schema.as_deref())
     }
 
     fn cache_path(&self) -> PathBuf {
@@ -142,7 +171,7 @@ impl CatalogSync {
         let Some(text) = read_cache_text(&self.cache_path())? else {
             return Ok(json!({"status": "empty", "catalog": null}));
         };
-        let cache = decode_cache(&text, self.source.as_ref())?;
+        let cache = decode_cache(&text, self.pin())?;
         Ok(json!({"status": "cached", "catalog": cache.catalog}))
     }
 
@@ -172,7 +201,7 @@ impl CatalogSync {
         // filesystem read is not.
         let cache = read_cache_text(&path)?
             .as_deref()
-            .and_then(|text| decode_cache(text, Some(source)).ok())
+            .and_then(|text| decode_cache(text, source.schema()).ok())
             .filter(|cache| cache.source == source.url.as_str());
         let revision = cache.as_ref().map(|cache| cache.catalog.revision.as_str());
         let updated = fetch(&source.url, revision).await.and_then(|catalog| {
@@ -183,15 +212,33 @@ impl CatalogSync {
         });
 
         match (updated, cache) {
-            (Ok(Some(catalog)), _) => {
+            (Ok(Some(catalog)), prior) => {
                 let cache = CachedCatalog {
                     source: source.url.as_str().to_owned(),
                     catalog,
                 };
-                let text =
-                    serde_json::to_string(&cache).map_err(|_| catalog_error(REFRESH_FAILED))?;
-                write_cache(&path, &text)?;
-                Ok(json!({"status": "fresh", "catalog": cache.catalog}))
+                // The serialized file must stay readable back — a body
+                // under the download bound can still overshoot it once
+                // the source/catalog wrapper lands. A cache the sync
+                // itself could never read again is a refresh failure:
+                // keep — and report — the last valid catalog.
+                let written = serde_json::to_string(&cache)
+                    .map_err(|_| catalog_error(REFRESH_FAILED))
+                    .and_then(|text| {
+                        if text.len() as u64 > MAX_BODY_BYTES {
+                            return Err(catalog_error(REFRESH_FAILED));
+                        }
+                        write_cache(&path, &text)
+                    });
+                match (written, prior) {
+                    (Ok(()), _) => Ok(json!({"status": "fresh", "catalog": cache.catalog})),
+                    (Err(_), Some(prior)) => Ok(json!({
+                        "status": "stale",
+                        "reasonCode": REFRESH_FAILED,
+                        "catalog": prior.catalog,
+                    })),
+                    (Err(_), None) => Err(catalog_error(REFRESH_FAILED)),
+                }
             }
             (Ok(None), Some(cache)) => Ok(json!({"status": "unchanged", "catalog": cache.catalog})),
             (Err(_), Some(cache)) => Ok(json!({
@@ -400,17 +447,29 @@ fn read_cache_text(path: &Path) -> Result<Option<String>> {
     }
 }
 
+/// The `schema` member's value — a nonblank pin string or none; a
+/// mistyped member is a source error whether a source exists or not.
+fn schema_pin(document: &Value) -> Result<Option<String>> {
+    match document.get("schema") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_str()
+            .filter(|schema| nonblank(schema))
+            .map(|schema| Some(schema.to_owned()))
+            .ok_or_else(|| catalog_error(SOURCE_INVALID)),
+    }
+}
+
 /// A cached document is the same validated shape a fetched one is — and
 /// names the source that produced it.
-fn decode_cache(text: &str, source: Option<&CatalogSource>) -> Result<CachedCatalog> {
+fn decode_cache(text: &str, schema: Option<&str>) -> Result<CachedCatalog> {
     let cache: CachedCatalog = serde_json::from_str(text).map_err(|_| catalog_error(INVALID))?;
     if https_url(&cache.source).is_none_or(|url| url.as_str() != cache.source) {
         return Err(catalog_error(INVALID));
     }
-    // The configured source's schema pin — the host's expectation —
-    // validates the cache when one exists; an offline read without a
-    // source falls back to the family check alone.
-    validate(&cache.catalog, source.and_then(CatalogSource::schema))?;
+    // The host's schema pin validates the cache when one exists;
+    // without one the family check alone decides.
+    validate(&cache.catalog, schema)?;
     Ok(cache)
 }
 
@@ -471,16 +530,26 @@ async fn decode_response(response: reqwest::Response) -> Result<Catalog> {
     Ok(catalog)
 }
 
-/// Replace the cache atomically: write a sibling temp file, then rename
-/// over the old one, so a crash mid-write never halves the document a
-/// later read validates.
+/// Replace the cache atomically: write a per-refresh sibling temp file,
+/// then rename over the old one, so a crash mid-write never halves the
+/// document a later read validates. Each write gets its own temp name —
+/// concurrent refreshes never share a writable handle, and one rename
+/// can only land a complete file.
 fn write_cache(path: &Path, text: &str) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|_| catalog_error(REFRESH_FAILED))?;
     }
-    let temp = path.with_extension("json.tmp");
-    std::fs::write(&temp, text).map_err(|_| catalog_error(REFRESH_FAILED))?;
-    std::fs::rename(&temp, path).map_err(|_| catalog_error(REFRESH_FAILED))
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let temp = path.with_extension(format!(
+        "{}.{}.tmp",
+        std::process::id(),
+        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = std::fs::write(&temp, text).and_then(|()| std::fs::rename(&temp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result.map_err(|_| catalog_error(REFRESH_FAILED))
 }
 
 #[cfg(test)]
@@ -640,6 +709,7 @@ mod tests {
         CatalogSync {
             dir: dir.to_owned(),
             source: Some(source(url)),
+            schema: None,
             client: fetch_client(),
         }
     }
@@ -724,6 +794,120 @@ mod tests {
         let read = sync.read().expect("read");
         assert_eq!(read["status"], "cached");
         assert_eq!(read["catalog"]["revision"], REVISION);
+    }
+
+    #[tokio::test]
+    async fn an_offline_read_honors_the_schema_pin() {
+        // A pin without a source still constrains the cache: a document
+        // from another namespace is invalid, never silently served.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sync = store(dir.path(), "https://catalog.example/v1/catalog");
+        sync.refresh_with(async |_, _| Ok(Some(catalog(REVISION))))
+            .await
+            .expect("seed");
+
+        let pinned = CatalogSync::new(dir.path())
+            .expect("sync")
+            .with_schema(Some("acme.model-catalog.v1".to_owned()));
+        assert!(pinned.read().is_err());
+        let pinned = pinned.with_schema(Some("vendor.model-catalog.v1".to_owned()));
+        assert_eq!(pinned.read().expect("read")["status"], "cached");
+        assert_eq!(
+            pinned.with_schema(None).read().expect("read")["status"],
+            "cached"
+        );
+
+        // A source-less `catalog` member carrying `schema` pins the same
+        // way — and a mistyped pin refuses at config.
+        let config = json!({"catalog": {
+            "cacheDir": dir.path(),
+            "schema": "acme.model-catalog.v1",
+        }});
+        let sync = CatalogSync::from_config(&config)
+            .expect("config")
+            .expect("sync");
+        assert!(sync.read().is_err());
+        assert!(
+            CatalogSync::from_config(&json!({"catalog": {
+                "cacheDir": dir.path(),
+                "schema": "   ",
+            }}))
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_failure_keeps_and_reports_the_last_valid_catalog() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sync = store(dir.path(), "https://catalog.example/v1/catalog");
+        sync.refresh_with(async |_, _| Ok(Some(catalog(REVISION))))
+            .await
+            .expect("seed");
+        let before = std::fs::read_to_string(dir.path().join(CACHE_FILE)).expect("cache");
+
+        // An unwritable cache directory makes the temp write fail: the
+        // refresh still answers the prior catalog as stale, the file is
+        // untouched and no temp litter remains.
+        let mut permissions = std::fs::metadata(dir.path())
+            .expect("metadata")
+            .permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(dir.path(), permissions).expect("readonly");
+        let stale = sync
+            .refresh_with(async |_, _| Ok(Some(catalog(OTHER_REVISION))))
+            .await
+            .expect("a failed write still answers");
+        let mut permissions = std::fs::metadata(dir.path())
+            .expect("metadata")
+            .permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(dir.path(), permissions).expect("writable");
+        assert_eq!(stale["status"], "stale");
+        assert_eq!(stale["reasonCode"], REFRESH_FAILED);
+        assert_eq!(stale["catalog"]["revision"], REVISION);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(CACHE_FILE)).expect("cache"),
+            before,
+            "the prior file is preserved"
+        );
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("dir")
+                .all(|entry| !entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")),
+            "no temp file survives a failed write"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_serialized_cache_keeps_the_prior_file() {
+        // A document near the bound can serialize past it once the
+        // source/catalog wrapper lands — such a cache could never be
+        // read back, so the refresh is a stale keep, not a fresh write.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sync = store(dir.path(), "https://catalog.example/v1/catalog");
+        sync.refresh_with(async |_, _| Ok(Some(catalog(REVISION))))
+            .await
+            .expect("seed");
+        let before = std::fs::read_to_string(dir.path().join(CACHE_FILE)).expect("cache");
+
+        let mut oversized = catalog(OTHER_REVISION);
+        oversized.providers[0].name = "x".repeat(MAX_BODY_BYTES as usize);
+        let stale = sync
+            .refresh_with(async |_, _| Ok(Some(oversized)))
+            .await
+            .expect("an unreadable cache still answers stale");
+        assert_eq!(stale["status"], "stale");
+        assert_eq!(stale["catalog"]["revision"], REVISION);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(CACHE_FILE)).expect("cache"),
+            before,
+            "the oversized cache never replaced the prior file"
+        );
     }
 
     #[test]
