@@ -23,7 +23,8 @@
 //! a resolver, the lease answers, and only refusal codes travel back.
 //! `upstreamDeadlineSecs` is the host's opt-in bound on one upstream call;
 //! absent or `0` waits unbounded — viable work runs to completion and only
-//! the caller cancels.
+//! the caller cancels. A bound beyond the monotonic clock's range never
+//! arrives and waits unbounded the same way.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -228,6 +229,9 @@ impl Service {
     /// `upstream_deadline` once the provider call outlives it, so one
     /// hung provider cannot stall the whole gateway. `None` is the
     /// caller-cancels model for hosts that bound the call themselves.
+    /// The arithmetic is checked at each wait: a duration the clock
+    /// cannot represent waits unbounded — the same answer the routes
+    /// document's `upstreamDeadlineSecs` gives an unnameable bound.
     pub fn with_upstream_deadline(mut self, deadline: Option<Duration>) -> Self {
         self.upstream_deadline = deadline;
         self
@@ -795,9 +799,15 @@ async fn buffered_result(
     let adapter = Arc::clone(&prepared.bound.adapter);
     let call = adapter.chat(prepared.request, &prepared.control);
     let output = match deadline {
-        Some(deadline) => match tokio::time::timeout(deadline, call).await {
-            Err(_) => return Err(Error::UpstreamDeadline(deadline)),
-            Ok(result) => result?,
+        Some(deadline) => match tokio::time::Instant::now().checked_add(deadline) {
+            // Checked arithmetic, not `Instant + duration`: a bound the
+            // clock cannot name never arrives — the call waits
+            // unbounded rather than panicking on the instant.
+            None => call.await?,
+            Some(at) => match tokio::time::timeout_at(at, call).await {
+                Err(_) => return Err(Error::UpstreamDeadline(deadline)),
+                Ok(result) => result?,
+            },
         },
         None => call.await?,
     };
@@ -840,7 +850,10 @@ async fn pump_frames(
     } = prepared;
     /// One upstream wait charged against `budget`: the elapsed wait
     /// comes out of the remaining allowance, so downstream stalls
-    /// between waits can never shorten the next read.
+    /// between waits can never shorten the next read. An exhausted
+    /// budget ends the stream before another wait starts — a
+    /// zero-length timeout still polls a ready frame once, letting the
+    /// stream run past the bound the host set.
     async fn upstream<T>(
         budget: &mut Option<Duration>,
         wait: impl std::future::Future<Output = T>,
@@ -848,8 +861,18 @@ async fn pump_frames(
         let Some(remaining) = budget else {
             return Ok(wait.await);
         };
+        if remaining.is_zero() {
+            return Err(PumpOutcome::Deadline);
+        }
         let started = tokio::time::Instant::now();
-        match tokio::time::timeout(*remaining, wait).await {
+        // The same checked arithmetic the buffered path uses: a bound
+        // the clock cannot name never arrives, so this wait — and every
+        // one after it — runs unbounded, like a host that opted out.
+        let Some(at) = started.checked_add(*remaining) else {
+            *budget = None;
+            return Ok(wait.await);
+        };
+        match tokio::time::timeout_at(at, wait).await {
             Ok(value) => {
                 *remaining = remaining.saturating_sub(started.elapsed());
                 Ok(value)
@@ -1204,5 +1227,106 @@ mod tests {
         }
         assert!(lock(&service.inflight.table).is_empty());
         assert_eq!(service.settle_len(), 0);
+    }
+
+    /// A canonical event stream whose every poll answers ready — the
+    /// shape a spent-budget wait must never even start.
+    struct ReadyStream {
+        events: std::collections::VecDeque<std::result::Result<a4mp::StreamEvent, a4mp::Error>>,
+    }
+
+    impl futures_core::Stream for ReadyStream {
+        type Item = std::result::Result<a4mp::StreamEvent, a4mp::Error>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Ready(self.events.pop_front())
+        }
+    }
+
+    /// Answers `chat_stream` with a ready stream — enough to prove a
+    /// spent budget never waits on it.
+    struct FramesAdapter {
+        target: a4mp::ServiceTarget,
+    }
+
+    #[async_trait::async_trait]
+    impl a4mp::Adapter for FramesAdapter {
+        fn target(&self) -> &a4mp::ServiceTarget {
+            &self.target
+        }
+
+        async fn chat(
+            &self,
+            _request: a4mp::ChatRequest,
+            _control: &a4mp::RequestControl,
+        ) -> std::result::Result<a4mp::Output, a4mp::Error> {
+            Ok(a4mp::Output::default())
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: a4mp::ChatRequest,
+            _control: &a4mp::RequestControl,
+        ) -> std::result::Result<a4mp::DynStream<'static, a4mp::StreamEvent>, a4mp::Error> {
+            Ok(Box::pin(ReadyStream {
+                events: [Ok(a4mp::StreamEvent::Finished { stop: None })].into(),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_spent_budget_ends_the_stream_before_the_next_wait() {
+        // The pump draws the deadline down to a remaining budget; once
+        // that budget is spent no new upstream wait may start — a
+        // zero-length Tokio timeout still polls a ready frame once,
+        // which would run the stream past the bound the host set.
+        let resolver: Arc<dyn a4mp::CredentialResolver> =
+            Arc::new(crate::leases::Leases::disconnected());
+        let mut router = Router::new(Arc::new(a4mp::ReqwestTransport::new()), resolver);
+        router
+            .register_adapter(
+                "frames-model",
+                "upstream-frames",
+                Arc::new(FramesAdapter {
+                    target: a4mp::ServiceTarget::new(
+                        "stub",
+                        a4mp::Protocol::Other("stub".to_owned()),
+                        url::Url::parse("https://stub.invalid/").expect("url"),
+                    ),
+                }),
+            )
+            .expect("register adapter");
+        let prepared = PreparedChat {
+            bound: router.resolve("frames-model").expect("bound"),
+            request: a4mp::ChatRequest::default(),
+            client_model: "frames-model".to_owned(),
+            dialect: a4mp::wire::WireDialect::OpenAiChatCompletions,
+            losses: Vec::new(),
+            control: a4mp::RequestControl::default(),
+        };
+        let (writer, _reader) = tokio::io::duplex(64 * 1024);
+        let writer: SharedWriter = Arc::new(tokio::sync::Mutex::new(Box::new(writer)));
+        let mut state = PumpState {
+            wrote_frame: false,
+            last_usage: None,
+            losses: Vec::new(),
+        };
+
+        let outcome = pump_frames(
+            &writer,
+            &json!(1),
+            prepared,
+            &mut state,
+            Some(Duration::ZERO),
+        )
+        .await;
+        assert!(
+            matches!(outcome, PumpOutcome::Deadline),
+            "a spent budget is the deadline outcome, not another wait"
+        );
+        assert!(!state.wrote_frame, "no frame reached the wire");
     }
 }

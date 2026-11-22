@@ -11,7 +11,8 @@
 //! credentialScope?} | {model,endpoint:{baseUrl,protocol},upstreamModel?,
 //! auth?,authHeader?,credentialScope?}]}` — the deadline bounds one
 //! upstream call when the host sets it (`0` or absent waits unbounded —
-//! the caller cancels; the sidecar never self-times-out viable work), and
+//! the caller cancels; the sidecar never self-times-out viable work, and
+//! a bound the clock cannot name waits unbounded the same way), and
 //! a malformed entry refuses startup rather than running half a table.
 //! A `credentialScope` is required on `api-key`/`bearer` routes and names
 //! a `credentialScopes` authorization: the credential ids from the
@@ -93,7 +94,10 @@ fn usage() -> ! {
 /// The upstream-deadline knob the routes document carries: absent or `0`
 /// waits unbounded — a viable call ends by caller cancel or provider
 /// answer. A positive value is the host's explicit bound on one upstream
-/// call, so a hung upstream cannot stall the whole gateway.
+/// call, so a hung upstream cannot stall the whole gateway. A bound
+/// beyond the monotonic clock's range is accepted here and waits
+/// unbounded at request time — checked arithmetic, never a panic — the
+/// same answer the SDK's deadline setter gives.
 fn upstream_deadline(config: &Value) -> Result<Option<Duration>> {
     match config.get("upstreamDeadlineSecs") {
         None => Ok(None),

@@ -854,6 +854,56 @@ async fn a_hung_upstream_errors_on_the_deadline_and_the_loop_recovers() {
 }
 
 #[tokio::test]
+async fn a_bound_the_clock_cannot_name_waits_unbounded() {
+    // `upstreamDeadlineSecs` accepts u64 seconds, so u64::MAX is legal
+    // configuration — and no monotonic instant can name it. The bound
+    // never arrives: the arithmetic is checked, the call waits
+    // unbounded like a host that opted out, and the sidecar answers
+    // instead of crashing on the clock math. Both forward paths and
+    // both knobs — the routes document's seconds and this setter's
+    // duration — share the one answer.
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let resolver = resolver_with_lease();
+    let adapter = stream_adapter(
+        Arc::clone(&resolver),
+        Arc::clone(&requests),
+        scripted_events(),
+        false,
+    );
+    let service = Service::new(test_router_with(resolver, adapter), Meter::unmetered())
+        .with_upstream_deadline(Some(Duration::from_secs(u64::MAX)));
+
+    let mut input = request_line(
+        1,
+        "chat.complete",
+        chat_params(
+            serde_json::json!({
+                "model": "ping-model",
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+            None,
+        ),
+    );
+    input.extend_from_slice(&request_line(
+        2,
+        "chat.stream",
+        chat_params(stream_body(), None),
+    ));
+    let replies = run(&service, &input).await;
+
+    assert!(
+        reply_for(&replies, 1)["result"]["body"].is_object(),
+        "the buffered call answers under an unnameable bound: {replies:?}"
+    );
+    let end = replies
+        .iter()
+        .filter(|r| r["id"] == 2 && r["stream"] == "end")
+        .collect::<Vec<_>>();
+    assert_eq!(end.len(), 1, "exactly one stream end line: {replies:?}");
+    assert_eq!(end[0]["status"], "done", "{replies:?}");
+}
+
+#[tokio::test]
 async fn a_rejected_request_is_not_counted_as_forwarded() {
     let resolver: Arc<dyn a4mp::CredentialResolver> = Arc::new(Leases::disconnected());
     let service = Service::new(
