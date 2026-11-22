@@ -1,6 +1,6 @@
 ---
 name: fairliny-sidecar
-description: Drive the fairliny gateway from any language — `fairliny serve` is an NDJSON stdio sidecar exposing models.list, chat.complete, chat.stream, chat.cancel and metrics.exposition.
+description: Drive the fairliny gateway from any language — `fairliny serve` is an NDJSON stdio sidecar exposing models.list, providers.list, catalog.read, catalog.refresh, chat.complete, chat.stream, chat.cancel and metrics.exposition.
 ---
 
 # fairliny Sidecar mode
@@ -23,6 +23,21 @@ JSON reply per stdout line.
   EOF ends the process.
 - `models.list` — the bound route table: configured surfaces and
   prebound adapters, never a provider discovery.
+- `providers.list` — `{vendors}`: the base-vendor directory — every
+  foundation-model profile a4mp declares, with its accepted
+  mechanisms and https endpoints (regions, Gemini's native
+  `gemini-generate-content`, Amazon Nova's Bedrock SigV4 path). A
+  discovery answer, not a reachability probe.
+- `catalog.read` — `{status: "empty"|"cached", catalog}`: the
+  validated local copy of the configured `*.model-catalog.v1`
+  document; never a network request.
+- `catalog.refresh` — `{status: "fresh"|"unchanged"|"stale",
+  catalog}`: one conditional GET against the configured source —
+  `If-None-Match` under the cached revision, `304` revalidates
+  without rewriting the cache, and a failed or invalid fetch keeps
+  and reports the last valid catalog. Requires the `catalog` config
+  member `{"cacheDir", "source"?, "schema"?}`; refresh is explicit —
+  the sidecar never polls on its own timer.
 - `chat.complete` / `chat.stream` — `params` is
   `{dialect, body, agent?}`: `dialect` is one of
   `openai-chat-completions`, `openai-responses`, `anthropic-messages`;

@@ -199,7 +199,10 @@ async fn serve(args: &[String]) -> Result<()> {
     } else {
         Meter::open(&state_root(args)?)?
     };
-    let service = Service::new(router, meter).with_upstream_deadline(deadline);
+    let catalog_sync = fairliny_gateway::catalog::CatalogSync::from_config(&config)?;
+    let service = Service::new(router, meter)
+        .with_upstream_deadline(deadline)
+        .with_catalog_sync(catalog_sync);
     // Tokio's stdin reads through its blocking pool, so an idle sidecar
     // still yields the runtime to the settlement tasks replies spawned.
     service

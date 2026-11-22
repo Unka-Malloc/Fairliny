@@ -37,6 +37,12 @@ pub enum Error {
     #[error("upstream deadline exceeded after {0:?}")]
     UpstreamDeadline(std::time::Duration),
 
+    /// The catalog sync refused: a malformed source or cache, a failed
+    /// refresh with nothing valid to keep. The message is the contract's
+    /// refusal code, never document content.
+    #[error("catalog: {0}")]
+    Catalog(String),
+
     /// The bound provider adapter failed the call.
     #[error("adapter: {0}")]
     Adapter(#[from] a4mp::Error),

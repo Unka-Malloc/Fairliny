@@ -179,6 +179,9 @@ pub struct Service {
     inflight: Arc<InFlight>,
     /// Spawned chat tasks, reaped like the settlement set.
     forward: Mutex<JoinSet<()>>,
+    /// The configured catalog sync, when the host declared one —
+    /// `catalog.read`/`catalog.refresh` answer from it.
+    catalog_sync: Option<crate::catalog::CatalogSync>,
 }
 
 impl Service {
@@ -191,7 +194,14 @@ impl Service {
             settle: Arc::new(Mutex::new(JoinSet::new())),
             inflight: Arc::new(InFlight::default()),
             forward: Mutex::new(JoinSet::new()),
+            catalog_sync: None,
         }
+    }
+
+    /// Attach the host-configured catalog sync.
+    pub fn with_catalog_sync(mut self, sync: Option<crate::catalog::CatalogSync>) -> Self {
+        self.catalog_sync = sync;
+        self
     }
 
     /// Set the deadline one upstream call gets: a bound the host chose,
@@ -306,6 +316,9 @@ impl Service {
         self.reap_settlements();
         match method {
             Some("models.list") => reply(id, self.models_list()),
+            Some("providers.list") => reply(id, self.providers_list()),
+            Some("catalog.read") => reply(id, self.catalog_read()),
+            Some("catalog.refresh") => reply(id, self.catalog_refresh().await),
             Some("chat.complete") => self.dispatch_buffered(id, params).await,
             // The cancel contract names its refusal verbatim — the
             // variant's own message crosses the wire, not the
@@ -502,6 +515,32 @@ impl Service {
             }));
         }
         Ok(json!({ "models": models }))
+    }
+
+    /// The base-vendor directory the router's catalog declares — every
+    /// vendor's name, accepted mechanisms and declared https endpoints,
+    /// a discovery answer, not a reachability probe.
+    fn providers_list(&self) -> Result<Value> {
+        crate::vendors::directory(self.router.catalog())
+    }
+
+    /// The locally cached catalog document — offline-only, never a
+    /// fetch.
+    fn catalog_read(&self) -> Result<Value> {
+        self.catalog_sync
+            .as_ref()
+            .ok_or_else(|| Error::Catalog("catalog_not_configured".to_owned()))?
+            .read()
+    }
+
+    /// One explicit revalidation against the configured source: fresh,
+    /// unchanged (`304`, no write) or stale-with-kept-catalog.
+    async fn catalog_refresh(&self) -> Result<Value> {
+        self.catalog_sync
+            .as_ref()
+            .ok_or_else(|| Error::Catalog("catalog_not_configured".to_owned()))?
+            .refresh()
+            .await
     }
 
     /// The exposition text a host mounts at `/metrics`. Pending

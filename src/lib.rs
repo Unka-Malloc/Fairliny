@@ -27,6 +27,7 @@
 //!   sidecar on stdio; [`export`] returns exposition text for a
 //!   host-mounted `/metrics` route — Fairliny never opens a socket.
 
+pub mod catalog;
 pub mod error;
 pub mod export;
 pub mod leases;
@@ -34,6 +35,7 @@ pub mod meter;
 pub mod router;
 pub mod service;
 pub mod transport;
+pub mod vendors;
 
 pub use error::Error;
 

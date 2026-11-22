@@ -86,7 +86,8 @@ fairliny serve [--config routes.json] [--state-root DIR] [--no-meter]
 One `{"id":N,"method":...,"params":{}}` per stdin line, one
 `{"id":N,"result"|"error"}` per stdout line; a malformed, oversized or
 non-UTF-8 line answers `id: null` and the loop continues. Methods:
-`models.list`, `chat.complete`, `chat.stream`, `chat.cancel`,
+`models.list`, `providers.list`, `catalog.read`, `catalog.refresh`,
+`chat.complete`, `chat.stream`, `chat.cancel`,
 `metrics.exposition`. Chat params are `{dialect, body, agent?}` over the
 three wire dialects (`openai-chat-completions`, `openai-responses`,
 `anthropic-messages`) — the body's `model` is the outward name;
@@ -149,6 +150,23 @@ The routes document is one object:
   resolves nothing — the route fails closed rather than borrowing
   another vendor's credential. This is what keeps catalog and custom
   routes that both ride `api-key` on separate keys.
+- `catalog` (optional) configures the read-only cloud model-catalog
+  sync: `{"cacheDir": "…", "source": "https://…", "schema": "…"}` —
+  `cacheDir` is required and holds the validated cache
+  (`model-catalog.json`); `source` is an HTTPS URL carrying no
+  credentials, query or fragment and its absence leaves the store
+  offline-only; `schema` optionally pins the exact
+  `<namespace>.model-catalog.v1` marker the host expects (unconfigured,
+  any family member passes). `catalog.read` answers the local cache —
+  never a fetch; `catalog.refresh` runs one conditional GET per
+  request — `If-None-Match` when a revision is cached, `304` answers
+  `unchanged` with no write, a valid `200` replaces the cache
+  atomically, and any failure reports `stale` while keeping the last
+  valid document. `providers.list` projects the base-vendor directory —
+  the foundation-model profiles a4mp declares, including regional
+  endpoints, Gemini's native `gemini-generate-content` protocol and
+  Amazon Nova's Bedrock SigV4 path — a discovery answer, not a
+  reachability probe.
 - A `provider` entry binds a catalog profile: `protocol` and `region`
   pin the profile's surface, and the profile must accept `auth`.
 - An `endpoint` entry binds a vendor the catalog does not carry, purely
