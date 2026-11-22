@@ -4,9 +4,10 @@
 //! `*.model-catalog.v1` family — the reseller/aggregator catalog shape
 //! any conforming producer serves — and this module keeps a validated
 //! local copy: an explicit refresh revalidates under the cached
-//! revision's ETag, a `304` confirms freshness without rewriting the
-//! cache, and a document the producer rejected, mangled or never sent
-//! leaves the last valid catalog in place. Reads are local-only; the
+//! revision's ETag, a `304` to that same-source revalidation confirms
+//! freshness without rewriting the cache, and a document the producer
+//! rejected, mangled or never sent leaves the last valid catalog in
+//! place. Reads are local-only; the
 //! document describes providers and models and never carries
 //! credentials, so no lease, key or token ever enters the fetch, the
 //! cache or the projections.
@@ -192,11 +193,12 @@ impl CatalogSync {
 
     /// Fetch the configured source once: an `If-None-Match`
     /// revalidation when the cache holds a revision this same source
-    /// wrote, a `304` answering `unchanged` with no write, a `200`
-    /// validating and replacing the cache atomically, and any failure
-    /// keeping — and reporting — the last valid catalog. Without a
-    /// configured source, or with no valid catalog to keep, the refresh
-    /// refuses.
+    /// wrote, a `304` to that revalidation answering `unchanged` with
+    /// no write, a `200` validating and replacing the cache atomically,
+    /// and any other answer — a `304` to a request that carried no
+    /// same-source revision included — failing the refresh and keeping,
+    /// and reporting, the last valid catalog. Without a configured
+    /// source, or with no valid catalog to keep, the refresh refuses.
     pub async fn refresh(&self) -> Result<Value> {
         self.refresh_with(async |url, revision| fetch(&self.client, url, revision).await)
             .await
@@ -234,12 +236,21 @@ impl CatalogSync {
             .as_ref()
             .filter(|cache| cache.source == source.url.as_str())
             .map(|cache| cache.catalog.revision.as_str());
+        // `unchanged` belongs to the revalidation that went out: a
+        // `304` answering a request that carried no same-source
+        // revision confirms nothing about this source and fails the
+        // refresh like any other bad answer.
+        let revalidated = revision.is_some();
         let updated = fetch(&source.url, revision).await.and_then(|catalog| {
             if let Some(catalog) = &catalog {
                 validate(catalog, pin)?;
             }
             Ok(catalog)
         });
+        let updated = match (updated, revalidated) {
+            (Ok(None), false) => Err(catalog_error(REFRESH_FAILED)),
+            (updated, _) => updated,
+        };
 
         match (updated, cache) {
             (Ok(Some(catalog)), prior) => {
@@ -840,6 +851,38 @@ mod tests {
             sync.refresh_with(async |_, _| Err(catalog_error(REFRESH_FAILED)))
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stray_304_after_a_source_change_is_a_stale_keep() {
+        // The source moved: the retained cache's revision belongs to
+        // the previous URL, so no `If-None-Match` goes out. A `304`
+        // answering that unconditional request confirms nothing about
+        // the new source — the refresh fails and the last valid catalog
+        // stays as `stale`, never an `unchanged`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seeded = store(dir.path(), "https://catalog.example/v1/catalog");
+        seeded
+            .refresh_with(async |_, _| Ok(Some(catalog(REVISION))))
+            .await
+            .expect("seed");
+
+        let moved = store(dir.path(), "https://catalog-b.example/v1/catalog");
+        let stale = moved
+            .refresh_with(async |_, revision| {
+                assert_eq!(revision, None, "another source's ETag never goes out");
+                Ok(None)
+            })
+            .await
+            .expect("a stray 304 still answers");
+        assert_eq!(stale["status"], "stale");
+        assert_eq!(stale["reasonCode"], REFRESH_FAILED);
+        assert_eq!(stale["catalog"]["revision"], REVISION);
+        assert_eq!(
+            moved.read().expect("read")["catalog"]["revision"],
+            REVISION,
+            "the stray 304 never touched the cache"
         );
     }
 
