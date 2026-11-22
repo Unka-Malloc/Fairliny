@@ -492,9 +492,13 @@ impl Router {
     /// profile must accept, and one declaration bind that refuses a
     /// missing or misspelled endpoint variable, an unbound protocol or a
     /// cleartext credential path — producing the surface the route binds
-    /// to. Nothing commits here; `load_routes` runs the same checks
-    /// against its staged table so a bad entry anywhere refuses the
-    /// whole document.
+    /// to. The declaration bind runs on a credential-disabled resolver:
+    /// it is a probe whose target gets registered, so no factory ever
+    /// observes the custody port before the binding publishes — and the
+    /// surface it reports is revalidated against the bare-base and
+    /// cleartext rules before it registers. Nothing commits here;
+    /// `load_routes` runs the same checks against its staged table so a
+    /// bad entry anywhere refuses the whole document.
     fn check_profile(
         &self,
         model: &str,
@@ -559,8 +563,9 @@ impl Router {
             }
         }
         let adapter = self
-            .bind_profile(route, Arc::clone(&self.resolver))
+            .bind_profile(route, declaration_resolver())
             .map_err(refuse)?;
+        check_bound_surface(adapter.target(), &route.auth).map_err(refuse)?;
         self.check_scope_resolver(scope).map_err(refuse)?;
         Ok(adapter.target().clone())
     }
@@ -606,8 +611,9 @@ impl Router {
             check_auth_header(&route.protocol, &route.auth, header).map_err(refuse)?;
         }
         let adapter = self
-            .bind_endpoint(route, Arc::clone(&self.resolver))
+            .bind_endpoint(route, declaration_resolver())
             .map_err(refuse)?;
+        check_bound_surface(adapter.target(), &route.auth).map_err(refuse)?;
         self.check_scope_resolver(scope).map_err(refuse)?;
         Ok(adapter.target().clone())
     }
@@ -874,7 +880,7 @@ impl Router {
         };
         if let Some(route) = self.routes.get(model) {
             let adapter = self
-                .bind_declared(self.scopes.get(model), |resolver| {
+                .bind_declared(self.scopes.get(model), &route.auth, |resolver| {
                     self.bind_profile(route, resolver)
                 })
                 .map_err(refused)?;
@@ -886,7 +892,7 @@ impl Router {
         }
         if let Some(route) = self.endpoint_routes.get(model) {
             let adapter = self
-                .bind_declared(self.scopes.get(model), |resolver| {
+                .bind_declared(self.scopes.get(model), &route.auth, |resolver| {
                     self.bind_endpoint(route, resolver)
                 })
                 .map_err(refused)?;
@@ -901,16 +907,18 @@ impl Router {
 
     /// The declared-route bind: the pinned-scope resolver for a scoped
     /// route — pinned to this router's own [`ScopeOwner`] slice, the
-    /// binding identity the route declared under — or the router's own
-    /// custody port for an unscoped one. The bind feeds the factory the
-    /// route's declared input again, so a transforming custom factory
-    /// is never fed its own output; the adapter it returns must land
-    /// back on the surface the declaration registered — an output that
-    /// drifted off it would resolve against a surface no live binding
-    /// covers, so the drift refuses here rather than at first forward.
+    /// registered surface and the declared mechanism, at the binding
+    /// generation live right now — or the router's own custody port for
+    /// an unscoped one. The bind feeds the factory the route's declared
+    /// input again, so a transforming custom factory is never fed its
+    /// own output; the adapter it returns must land back on the surface
+    /// the declaration registered — an output that drifted off it would
+    /// resolve against a surface no live binding covers, so the drift
+    /// refuses here rather than at first forward.
     fn bind_declared(
         &self,
         binding: Option<&ScopedBinding>,
+        auth: &AuthKind,
         bind: impl FnOnce(Arc<dyn CredentialResolver>) -> std::result::Result<Arc<dyn Adapter>, String>,
     ) -> std::result::Result<Arc<dyn Adapter>, String> {
         let resolver: Arc<dyn CredentialResolver> = match binding {
@@ -922,6 +930,8 @@ impl Router {
                     Arc::clone(leases),
                     self.scope_owner,
                     binding.scope.clone(),
+                    &binding.target,
+                    auth,
                 ))
             }
             None => Arc::clone(&self.resolver),
@@ -1060,18 +1070,32 @@ pub fn endpoint_authority(url: &Url) -> String {
     }
 }
 
+/// The resolver a declaration check binds with: credential-disabled.
+/// The declaration adapter is a probe whose target gets registered —
+/// never a serving adapter — and a custom factory must not observe the
+/// real custody port before the scoped binding is published: resolving
+/// through it could reach credentials outside the declared binding.
+fn declaration_resolver() -> Arc<dyn CredentialResolver> {
+    Arc::new(a4mp::NoCredentials)
+}
+
+/// Whether a URL is a bare `http(s)` base: a host, no embedded
+/// credentials and no query or fragment.
+fn bare_base(url: &Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some_and(|host| !host.is_empty())
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
+
 /// An endpoint base URL is a bare `http(s)` base: a host, no embedded
 /// credentials (secret bytes would ride every projection of the route),
 /// and no query or fragment (protocol path joins would silently drop
 /// them). The refusal never quotes the URL.
 fn check_base_url(url: &Url) -> std::result::Result<(), String> {
-    let bare = matches!(url.scheme(), "http" | "https")
-        && url.host_str().is_some_and(|host| !host.is_empty())
-        && url.username().is_empty()
-        && url.password().is_none()
-        && url.query().is_none()
-        && url.fragment().is_none();
-    if bare {
+    if bare_base(url) {
         Ok(())
     } else {
         Err(
@@ -1080,6 +1104,22 @@ fn check_base_url(url: &Url) -> std::result::Result<(), String> {
                 .to_owned(),
         )
     }
+}
+
+/// The surface a bound adapter reports must pass the same checks the
+/// declared input passed — a bare base and the cleartext-credential
+/// policy. The declaration registers this target and scoped credentials
+/// flow to it, so a transforming custom factory can never land the
+/// credential on a surface the declaration would have refused.
+fn check_bound_surface(target: &ServiceTarget, auth: &AuthKind) -> std::result::Result<(), String> {
+    if !bare_base(&target.base_url) {
+        return Err(
+            "the adapter's bound target must be an http(s) URL with a host and no \
+             credentials, query or fragment"
+                .to_owned(),
+        );
+    }
+    check_cleartext_policy(&target.base_url, auth)
 }
 
 /// The cleartext policy a4mp 0.4.0 applies to every profile endpoint

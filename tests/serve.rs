@@ -2967,3 +2967,363 @@ async fn a_scoped_custom_factory_receives_the_declared_target() {
         other => panic!("expected an api-key credential: {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn a_republished_binding_is_a_new_generation_for_retained_adapters() {
+    // A publish that leaves a binding untouched keeps the retained
+    // adapter's pin alive, but a retirement followed by an identical
+    // republish is a different binding: the surface and scope read the
+    // same, yet the detached adapter's pin must stay refused.
+    let epoch = Arc::new(Epochs {
+        current: Mutex::new(uuid::Uuid::new_v4().to_string()),
+    });
+    let epoch_id = epoch.current.lock().unwrap().clone();
+    let id = uuid::Uuid::new_v4().to_string();
+    let leases = Arc::new(Leases::disconnected());
+    leases.authorize_scope("scope-a", [&id]).expect("scope");
+    leases
+        .install_handoff(&handoff_document(&epoch_id, &[(&id, b"key-a")]), epoch)
+        .expect("install");
+
+    let resolvers: Arc<Mutex<Vec<Arc<dyn a4mp::CredentialResolver>>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&resolvers);
+    let mut catalog = a4mp::Catalog::new(Vec::new()).expect("catalog");
+    catalog.register_adapter(
+        a4mp::Protocol::Other("vendor".to_owned()),
+        Arc::new(move |target, _auth, _transport, resolver, _effects| {
+            recorded.lock().expect("resolvers").push(resolver);
+            Ok(Arc::new(HungAdapter { target }) as Arc<dyn a4mp::Adapter>)
+        }),
+    );
+    let endpoint = |base_url: &str| {
+        EndpointRoute::from_document(&serde_json::json!({
+            "model": "m",
+            "endpoint": {"baseUrl": base_url, "protocol": "other:vendor"},
+            "auth": "api-key"
+        }))
+        .expect("route")
+        .1
+    };
+    let mut router =
+        Router::with_catalog_leases(catalog, loopback_transport(), Arc::clone(&leases));
+    router
+        .add_endpoint_route_scoped("m", endpoint("https://a.vendor.example/v1"), "scope-a")
+        .expect("declare m");
+    let surface_a = router
+        .resolve("m")
+        .expect("resolve m")
+        .adapter
+        .target()
+        .clone();
+    // The resolution bind's resolver is the pinned one — the
+    // declaration bind records its own first.
+    let pinned = resolvers
+        .lock()
+        .expect("resolvers")
+        .last()
+        .expect("the scoped bind's resolver")
+        .clone();
+    static API_KEY: a4mp::AuthKind = a4mp::AuthKind::ApiKey;
+    let pinned_scope = || a4mp::CredentialScope {
+        target: &surface_a,
+        auth: &API_KEY,
+    };
+    match a4mp::CredentialResolver::resolve(pinned.as_ref(), pinned_scope())
+        .await
+        .expect("the live binding resolves")
+    {
+        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), "key-a"),
+        other => panic!("expected an api-key credential: {other:?}"),
+    }
+
+    // A republish adding a sibling route leaves m's binding untouched:
+    // the retained pin — generation and all — keeps resolving.
+    router
+        .add_endpoint_route_scoped("m2", endpoint("https://b.vendor.example/v1"), "scope-a")
+        .expect("declare m2");
+    a4mp::CredentialResolver::resolve(pinned.as_ref(), pinned_scope())
+        .await
+        .expect("an unchanged publish keeps the pin alive");
+
+    // Retire m's surface: replacing it with an unauthenticated route
+    // drops the binding, and the pin fails closed.
+    let none = EndpointRoute::from_document(&serde_json::json!({
+        "model": "m",
+        "endpoint": {"baseUrl": "https://c.vendor.example/v1", "protocol": "other:vendor"}
+    }))
+    .expect("route")
+    .1;
+    router
+        .add_endpoint_route("m", none)
+        .expect("an unscoped replacement retires the binding");
+    let error = a4mp::CredentialResolver::resolve(pinned.as_ref(), pinned_scope())
+        .await
+        .expect_err("a retired binding fails closed");
+    assert!(
+        error.to_string().contains("credential_scope_retired"),
+        "{error}"
+    );
+
+    // Publish the same surface and scope again: a different binding —
+    // the retained adapter's pin never regains credentials.
+    router
+        .add_endpoint_route_scoped("m3", endpoint("https://a.vendor.example/v1"), "scope-a")
+        .expect("the identical republish declares");
+    let error = a4mp::CredentialResolver::resolve(pinned.as_ref(), pinned_scope())
+        .await
+        .expect_err("a republished binding never revives a retired pin");
+    assert!(
+        error.to_string().contains("credential_scope_retired"),
+        "{error}"
+    );
+
+    // While the new binding's own adapter resolves normally.
+    router.resolve("m3").expect("resolve m3");
+    let pinned_new = resolvers
+        .lock()
+        .expect("resolvers")
+        .last()
+        .expect("the republished bind's resolver")
+        .clone();
+    match a4mp::CredentialResolver::resolve(pinned_new.as_ref(), pinned_scope())
+        .await
+        .expect("the republished binding resolves for its own pin")
+    {
+        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), "key-a"),
+        other => panic!("expected an api-key credential: {other:?}"),
+    }
+}
+
+/// Poll a resolver's answer synchronously — every resolver a bind sees
+/// here answers from in-process tables and completes on the first poll,
+/// so a no-op waker settles it inside the synchronous factory.
+fn resolve_now<'a>(
+    resolver: &Arc<dyn a4mp::CredentialResolver>,
+    target: &'a a4mp::ServiceTarget,
+    auth: &'a a4mp::AuthKind,
+) -> std::result::Result<a4mp::Credential, a4mp::Error> {
+    let mut future = Box::pin(resolver.resolve(a4mp::CredentialScope { target, auth }));
+    let waker = std::task::Waker::noop();
+    let mut context = std::task::Context::from_waker(waker);
+    match future.as_mut().poll(&mut context) {
+        std::task::Poll::Ready(result) => result,
+        std::task::Poll::Pending => panic!("an in-process resolver never pends"),
+    }
+}
+
+#[tokio::test]
+async fn a_scoped_resolver_answers_only_its_declared_binding() {
+    // The declaration bind hands the factory a credential-disabled
+    // resolver — resolving through it answers `Credential::None` rather
+    // than reaching the custody port before the binding publishes. The
+    // pinned resolver an adapter receives at bind answers only for the
+    // registered surface and the declared mechanism: a sibling surface
+    // sharing the owner's slice and scope, or another mechanism, is
+    // outside the declared binding.
+    let epoch = Arc::new(Epochs {
+        current: Mutex::new(uuid::Uuid::new_v4().to_string()),
+    });
+    let epoch_id = epoch.current.lock().unwrap().clone();
+    let id = uuid::Uuid::new_v4().to_string();
+    let leases = Arc::new(Leases::disconnected());
+    leases.authorize_scope("scope-a", [&id]).expect("scope");
+    leases
+        .install_handoff(&handoff_document(&epoch_id, &[(&id, b"key-a")]), epoch)
+        .expect("install");
+
+    let resolvers: Arc<Mutex<Vec<Arc<dyn a4mp::CredentialResolver>>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let saw_none: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut catalog = a4mp::Catalog::new(Vec::new()).expect("catalog");
+    {
+        let resolvers = Arc::clone(&resolvers);
+        let saw_none = Arc::clone(&saw_none);
+        catalog.register_adapter(
+            a4mp::Protocol::Other("vendor".to_owned()),
+            Arc::new(move |target, _auth, _transport, resolver, _effects| {
+                let answer = resolve_now(&resolver, &target, &a4mp::AuthKind::ApiKey);
+                saw_none
+                    .lock()
+                    .expect("saw_none")
+                    .push(matches!(answer, Ok(a4mp::Credential::None)));
+                resolvers.lock().expect("resolvers").push(resolver);
+                Ok(Arc::new(HungAdapter { target }) as Arc<dyn a4mp::Adapter>)
+            }),
+        );
+    }
+    let endpoint = |base_url: &str| {
+        EndpointRoute::from_document(&serde_json::json!({
+            "model": "m",
+            "endpoint": {"baseUrl": base_url, "protocol": "other:vendor"},
+            "auth": "api-key"
+        }))
+        .expect("route")
+        .1
+    };
+    let mut router =
+        Router::with_catalog_leases(catalog, loopback_transport(), Arc::clone(&leases));
+    router
+        .add_endpoint_route_scoped("m1", endpoint("https://a.vendor.example/v1"), "scope-a")
+        .expect("declare m1");
+    router
+        .add_endpoint_route_scoped("m2", endpoint("https://b.vendor.example/v1"), "scope-a")
+        .expect("declare m2");
+
+    // Both declaration binds resolved nothing: the factory saw the
+    // credential-disabled resolver, never the lease port.
+    assert_eq!(*saw_none.lock().expect("saw_none"), [true, true]);
+
+    let surface_a = router
+        .resolve("m1")
+        .expect("resolve m1")
+        .adapter
+        .target()
+        .clone();
+    let surface_b = router
+        .resolve("m2")
+        .expect("resolve m2")
+        .adapter
+        .target()
+        .clone();
+    // Binds ran: declare m1, declare m2, resolve m1, resolve m2 — the
+    // m1 resolution bind's pinned resolver is the third recorded.
+    let binds: Vec<_> = resolvers.lock().expect("resolvers").clone();
+    let pinned = binds[2].clone();
+    static API_KEY: a4mp::AuthKind = a4mp::AuthKind::ApiKey;
+    static BEARER: a4mp::AuthKind = a4mp::AuthKind::Bearer;
+    match a4mp::CredentialResolver::resolve(
+        pinned.as_ref(),
+        a4mp::CredentialScope {
+            target: &surface_a,
+            auth: &API_KEY,
+        },
+    )
+    .await
+    .expect("the declared surface and mechanism resolve")
+    {
+        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), "key-a"),
+        other => panic!("expected an api-key credential: {other:?}"),
+    }
+    // The sibling surface shares the owner's slice and scope — and is
+    // still outside this adapter's declared binding.
+    let error = a4mp::CredentialResolver::resolve(
+        pinned.as_ref(),
+        a4mp::CredentialScope {
+            target: &surface_b,
+            auth: &API_KEY,
+        },
+    )
+    .await
+    .expect_err("a sibling surface is outside the pin");
+    assert!(
+        error.to_string().contains("credential_scope_mismatch"),
+        "{error}"
+    );
+    // As is another mechanism on the pinned surface itself.
+    let error = a4mp::CredentialResolver::resolve(
+        pinned.as_ref(),
+        a4mp::CredentialScope {
+            target: &surface_a,
+            auth: &BEARER,
+        },
+    )
+    .await
+    .expect_err("another mechanism is outside the pin");
+    assert!(
+        error.to_string().contains("credential_scope_mismatch"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_transformed_target_must_pass_the_bound_surface_policy() {
+    // The credential scope registers the surface the bound adapter
+    // reports — the factory's output, not its input — so the bare-base
+    // and cleartext-credential rules apply to that output: a factory
+    // rewriting the surface onto cleartext http to a public host, or
+    // onto a URL carrying credentials, refuses at declaration and
+    // nothing commits.
+    let id = uuid::Uuid::new_v4().to_string();
+    let leases = Arc::new(Leases::disconnected());
+    leases.authorize_scope("scope-a", [&id]).expect("scope");
+    let endpoint = || {
+        EndpointRoute::from_document(&serde_json::json!({
+            "model": "m",
+            "endpoint": {"baseUrl": "https://a.vendor.example/v1", "protocol": "other:vendor"},
+            "auth": "api-key"
+        }))
+        .expect("route")
+        .1
+    };
+    let catalog_with = |rewrite: fn(&mut url::Url)| {
+        let mut catalog = a4mp::Catalog::new(Vec::new()).expect("catalog");
+        catalog.register_adapter(
+            a4mp::Protocol::Other("vendor".to_owned()),
+            Arc::new(move |mut target, _auth, _transport, _resolver, _effects| {
+                rewrite(&mut target.base_url);
+                Ok(Arc::new(HungAdapter { target }) as Arc<dyn a4mp::Adapter>)
+            }),
+        );
+        catalog
+    };
+
+    // Cleartext http to a public host: the declared input was https,
+    // but the surface credentials would flow to is not.
+    let mut router = Router::with_catalog_leases(
+        catalog_with(|url| {
+            url.set_scheme("http").expect("scheme");
+            url.set_host(Some("203.0.113.9")).expect("host");
+        }),
+        loopback_transport(),
+        Arc::clone(&leases),
+    );
+    let error = router
+        .add_endpoint_route_scoped("m", endpoint(), "scope-a")
+        .expect_err("a cleartext-public output refuses");
+    assert!(error.to_string().contains("cleartext"), "{error}");
+    assert!(router.resolve("m").is_err());
+
+    // Embedded credentials in the reported surface: the bound target
+    // must stay a bare base like the declared one.
+    let mut router = Router::with_catalog_leases(
+        catalog_with(|url| {
+            url.set_username("svc").expect("username");
+            url.set_password(Some("hunter2")).expect("password");
+        }),
+        loopback_transport(),
+        Arc::clone(&leases),
+    );
+    let error = router
+        .add_endpoint_route_scoped("m", endpoint(), "scope-a")
+        .expect_err("a credential-bearing output refuses");
+    assert!(error.to_string().contains("bound target"), "{error}");
+    assert!(router.resolve("m").is_err());
+
+    // A profile route takes the same check: the openai profile's chat
+    // factory rewritten to a cleartext-public surface refuses too.
+    let mut catalog = a4mp::Catalog::new(a4mp::catalog::builtin_profiles()).expect("catalog");
+    catalog.register_adapter(
+        a4mp::Protocol::OpenAiChatCompletions,
+        Arc::new(|mut target, _auth, _transport, _resolver, _effects| {
+            target.base_url.set_scheme("http").expect("scheme");
+            target.base_url.set_host(Some("203.0.113.9")).expect("host");
+            Ok(Arc::new(HungAdapter { target }) as Arc<dyn a4mp::Adapter>)
+        }),
+    );
+    let mut router =
+        Router::with_catalog_leases(catalog, loopback_transport(), Arc::clone(&leases));
+    let route = Route {
+        provider: a4mp::ProviderId::new("openai"),
+        protocol: Some(a4mp::Protocol::OpenAiChatCompletions),
+        region: None,
+        auth: a4mp::AuthKind::ApiKey,
+        upstream_model: "gpt".to_owned(),
+        vars: Default::default(),
+    };
+    let error = router
+        .add_route_scoped("m", route, "scope-a")
+        .expect_err("a cleartext-public profile output refuses");
+    assert!(error.to_string().contains("cleartext"), "{error}");
+    assert!(router.resolve("m").is_err());
+}
