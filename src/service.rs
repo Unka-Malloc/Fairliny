@@ -177,10 +177,6 @@ pub struct Service {
     settle: Arc<Mutex<JoinSet<()>>>,
     /// In-flight request claims, for `chat.cancel`.
     inflight: Arc<InFlight>,
-    /// Spawned chat and catalog tasks, reaped like the settlement set.
-    /// Each task yields its reply's write result so a reply that never
-    /// reached the wire fails the serve instead of passing silently.
-    forward: Mutex<JoinSet<std::io::Result<()>>>,
     /// The configured catalog sync, when the host declared one —
     /// `catalog.read`/`catalog.refresh` answer from it.
     catalog_sync: Option<Arc<crate::catalog::CatalogSync>>,
@@ -195,7 +191,6 @@ impl Service {
             upstream_deadline: None,
             settle: Arc::new(Mutex::new(JoinSet::new())),
             inflight: Arc::new(InFlight::default()),
-            forward: Mutex::new(JoinSet::new()),
             catalog_sync: None,
         }
     }
@@ -248,8 +243,7 @@ impl Service {
     /// `reap_settlements` keeps on the settlement set. A finished task's
     /// reply write result surfaces here: a reply that never reached the
     /// wire fails the serve instead of being counted as delivered.
-    fn reap_forward(&self) -> std::io::Result<()> {
-        let mut tasks = lock(&self.forward);
+    fn reap_forward(tasks: &mut JoinSet<std::io::Result<()>>) -> std::io::Result<()> {
         while let Some(result) = tasks.try_join_next() {
             forward_result(result)?;
         }
@@ -361,19 +355,62 @@ impl Service {
     /// The stdin loop: unary requests answer inline; chat requests and
     /// catalog refreshes run on their own tasks so one slow upstream or
     /// source never serializes the gateway — replies and stream frames
-    /// for different requests may interleave, correlate by `id`. EOF
-    /// drains in-flight work to completion; the sidecar cancels nothing
-    /// on its own.
+    /// for different requests may interleave, correlate by `id`. A
+    /// finished task's result surfaces beside the input wait, so a
+    /// reply the wire refused fails the serve while the request pipe is
+    /// still open; EOF drains in-flight work to completion, and a
+    /// failed serve still drains and persists metering before the error
+    /// propagates. The sidecar cancels nothing on its own.
     pub async fn serve(
+        &self,
+        input: impl AsyncBufRead + Unpin,
+        output: impl AsyncWrite + Unpin + Send + 'static,
+    ) -> std::io::Result<()> {
+        let result = self.serve_loop(input, output).await;
+        // A failed serve still owes the journal: settlements drain and
+        // the counters persist before the error propagates — a lost
+        // reply never forfeits the metering behind it.
+        if result.is_err() {
+            self.flush_metering().await;
+        }
+        result
+    }
+
+    /// `serve`'s loop: reads request lines, answers or spawns forward
+    /// work, and ends on EOF or a wire failure. Every `?` here is the
+    /// error `serve` reports after the metering drain.
+    async fn serve_loop(
         &self,
         mut input: impl AsyncBufRead + Unpin,
         output: impl AsyncWrite + Unpin + Send + 'static,
     ) -> std::io::Result<()> {
         let writer: SharedWriter = Arc::new(tokio::sync::Mutex::new(Box::new(output)));
+        // The spawned chat and catalog tasks this loop owns: each
+        // yields its reply's write result so a reply that never reached
+        // the wire fails the serve instead of passing silently.
+        let mut forward: JoinSet<std::io::Result<()>> = JoinSet::new();
         let mut line = Vec::new();
         loop {
-            line.clear();
-            match read_capped_line(&mut input, &mut line).await? {
+            let input_line = tokio::select! {
+                input_line = read_capped_line(&mut input, &mut line) => input_line?,
+                finished = forward.join_next(), if !forward.is_empty() => {
+                    // A finished task observed beside the input wait:
+                    // a reply that never landed fails the serve now,
+                    // not at the next dispatch or EOF. A cancelled read
+                    // loses nothing — the bytes it already consumed are
+                    // still in `line`, and the next call appends the
+                    // rest of the same line.
+                    if let Some(result) = finished {
+                        forward_result(result)?;
+                    }
+                    continue;
+                }
+            };
+            // The buffer only holds the next line's bytes while a read
+            // is in flight; take the finished one so continuations and
+            // later lines start clean.
+            let completed = std::mem::take(&mut line);
+            match input_line {
                 InputLine::Eof => break,
                 InputLine::Oversized => {
                     write_line(
@@ -385,7 +422,7 @@ impl Service {
                 }
                 InputLine::Complete => {}
             }
-            let Ok(text) = std::str::from_utf8(&line) else {
+            let Ok(text) = std::str::from_utf8(&completed) else {
                 write_line(
                     &writer,
                     &json!({"id": null, "error": "bad request line: not utf-8"}),
@@ -423,20 +460,19 @@ impl Service {
                         write_line(&writer, &error_reply(id, "request id in-flight")).await?;
                         continue;
                     };
-                    self.reap_forward()?;
+                    Self::reap_forward(&mut forward)?;
                     let meter = Arc::clone(&self.meter);
                     let settle = Arc::clone(&self.settle);
                     let deadline = self.upstream_deadline;
                     let task_writer = Arc::clone(&writer);
-                    let mut tasks = lock(&self.forward);
                     if method == Some("chat.complete") {
-                        tasks.spawn(async move {
+                        forward.spawn(async move {
                             let result = buffered_result(&meter, &settle, deadline, prepared).await;
                             drop(claim);
                             write_line(&task_writer, &reply(id, result)).await
                         });
                     } else {
-                        tasks.spawn(async move {
+                        forward.spawn(async move {
                             run_stream(&task_writer, &meter, &settle, deadline, id, prepared, claim)
                                 .await
                         });
@@ -446,12 +482,13 @@ impl Service {
                     // The refresh is tracked background work like a
                     // forward: a slow source never delays the next
                     // request or a chat cancel, and the refresh reply
-                    // still lands on the wire — and drains on EOF.
+                    // still lands on the wire — observed mid-loop or
+                    // drained on EOF.
                     Some(sync) => {
-                        self.reap_forward()?;
+                        Self::reap_forward(&mut forward)?;
                         let sync = Arc::clone(sync);
                         let task_writer = Arc::clone(&writer);
-                        lock(&self.forward).spawn(async move {
+                        forward.spawn(async move {
                             let result = sync.refresh().await;
                             write_line(&task_writer, &reply(id, result)).await
                         });
@@ -476,9 +513,8 @@ impl Service {
         // In-flight work runs to completion — its replies still belong on
         // the wire. A reply that never landed is a serve failure, not a
         // clean drain.
-        let mut drained = std::mem::take(&mut *lock(&self.forward));
         let mut failure = None;
-        while let Some(result) = drained.join_next().await {
+        while let Some(result) = forward.join_next().await {
             if let Err(error) = forward_result(result) {
                 failure = failure.or(Some(error));
             }
@@ -985,7 +1021,6 @@ mod tests {
             )
             .expect("register adapter");
         let service = Service::new(router, Meter::unmetered());
-        poison(&service.forward);
         poison(&service.settle);
         poison(&service.inflight.table);
 

@@ -507,6 +507,34 @@ async fn a_lost_refresh_reply_fails_the_serve() {
 }
 
 #[tokio::test]
+async fn a_lost_reply_fails_the_serve_while_input_stays_open() {
+    use tokio::io::AsyncWriteExt;
+
+    // The request pipe stays open and silent — nothing more arrives —
+    // but the refresh task's failed reply still surfaces: the host
+    // sees the serve die instead of a sidecar waiting on stdin
+    // forever.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sync = CatalogSync::new(dir.path()).expect("sync");
+    let service = service_with(Some(sync));
+    let (mut requests, input) = tokio::io::duplex(4096);
+    let (output, reader) = tokio::io::duplex(64 * 1024);
+    drop(reader);
+    requests
+        .write_all(b"{\"id\":1,\"method\":\"catalog.refresh\",\"params\":{}}\n")
+        .await
+        .expect("request");
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        service.serve(tokio::io::BufReader::new(input), output),
+    )
+    .await
+    .expect("the serve fails while the request pipe stays open");
+    assert!(result.is_err(), "a lost refresh reply is a serve failure");
+    drop(requests);
+}
+
+#[tokio::test]
 async fn a_lease_backed_service_serves_discovery_and_catalog_together() {
     // The sidecar's real shape — a lease-backed router plus a
     // configured sync — answers both projections on one dispatch

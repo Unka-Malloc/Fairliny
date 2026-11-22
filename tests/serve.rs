@@ -553,6 +553,49 @@ async fn a_failed_meter_never_fails_the_reply() {
 }
 
 #[tokio::test]
+async fn a_lost_reply_still_drains_and_persists_metering() {
+    // The reply never reaches the wire — the serve fails — but the
+    // settlement the forward spawned is drained and the counters
+    // persist before the error returns: a lost reply never forfeits
+    // the journal.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let service = Service::new(
+        test_router(resolver_with_lease(), Arc::clone(&requests)),
+        test_meter(dir.path()),
+    );
+    let (output, reader) = tokio::io::duplex(64 * 1024);
+    drop(reader);
+    let input = request_line(
+        1,
+        "chat.complete",
+        chat_params(
+            serde_json::json!({
+                "model": "ping-model",
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+            Some("caller"),
+        ),
+    );
+    assert!(
+        service.serve(&input[..], output).await.is_err(),
+        "a lost reply is a serve failure"
+    );
+    // No flush_metering call here — the serve itself drained the
+    // settle set and persisted before returning the error.
+    assert_eq!(service.settle_len(), 0, "settlements drained");
+    let facts = service.meter().facts();
+    assert!(
+        facts.iter().any(|fact| {
+            fact.scope_ref == "gateway:forwarded"
+                && fact.metric == token_usage_detector::metrics::TOKENS_INPUT
+                && fact.value.as_deref() == Some("3")
+        }),
+        "the settled input count is a fact: {facts:?}"
+    );
+}
+
+#[tokio::test]
 async fn an_unresolved_credential_or_model_fails_closed() {
     let resolver: Arc<dyn a4mp::CredentialResolver> = Arc::new(Leases::disconnected());
     let service = Service::new(
