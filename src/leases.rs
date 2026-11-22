@@ -228,13 +228,31 @@ impl LeaseState {
 
 /// One live surface binding: the scope it resolves under and the
 /// generation identifying *this* binding. A republish that keeps the
-/// surface on the same scope carries the generation forward; a
-/// retirement or a scope change mints a fresh one, so a resolver pinned
-/// to the earlier binding can never ride its replacement.
+/// surface, mechanism and scope carries the generation forward; a
+/// retirement, a mechanism swap or a scope change mints a fresh one,
+/// so a resolver pinned to the earlier binding can never ride its
+/// replacement — a retained adapter bound under the old mechanism fails
+/// closed even while the surface's new mechanism resolves.
 #[derive(Clone)]
 struct LiveBinding {
     scope: String,
     generation: u64,
+}
+
+/// The identity a surface binding registers and resolves under: the
+/// bound surface's key plus the leased mechanism the route declared.
+/// Mechanisms are tracked separately — replacing an `api-key` route
+/// with a `bearer` one on the same surface and scope is a different
+/// binding, so the retired mechanism's generation dies with the last
+/// route that used it while the surface's other mechanism binds fresh.
+type BindingKey = (String, ProviderCredential);
+
+/// The composite key a bound surface-and-mechanism pair registers
+/// under. Two outward names bound to the same surface and mechanism
+/// share its credential scope; a different mechanism on the same
+/// surface is its own binding.
+fn binding_key(target: &ServiceTarget, kind: ProviderCredential) -> BindingKey {
+    (target_key(target), kind)
 }
 
 /// The gateway's custody port: the process-local lease behind every
@@ -245,14 +263,14 @@ pub struct Leases {
     state: Mutex<LeaseState>,
     /// Scope name → the credential ids the host authorized for it.
     authorizations: Mutex<BTreeMap<String, BTreeSet<String>>>,
-    /// Binding owner → (bound surface key → the live binding, or a
-    /// retired marker). Each router publishes its scoped routes'
+    /// Binding owner → (bound surface+mechanism key → the live binding,
+    /// or a retired marker). Each router publishes its scoped routes'
     /// surfaces under its own [`ScopeOwner`], so its publish retires its
     /// slice and nothing else; a surface an owner's republish drops keeps
     /// a tombstone, so an adapter detached by that republish fails closed
     /// rather than slipping back to the unscoped slot. Resolution
     /// dispatches on the live bindings every owner's table names.
-    target_scopes: Mutex<BTreeMap<ScopeOwner, BTreeMap<String, Option<LiveBinding>>>>,
+    target_scopes: Mutex<BTreeMap<ScopeOwner, BTreeMap<BindingKey, Option<LiveBinding>>>>,
     /// The binding-generation counter: every newly established surface
     /// binding takes the next value, so a resolver can pin the exact
     /// binding it was minted for — a retired-and-republished binding is
@@ -477,35 +495,36 @@ impl Leases {
     }
 
     /// Publish the whole bound-surface table for `owner` in one swap:
-    /// every live scoped route's surface → the scope it declared. The
-    /// table is validated before it lands — a scope the host did not
-    /// authorize, or two surfaces pointing at different scopes for one
-    /// key, refuses the whole publish — and the swap covers only the
-    /// owner's own slice, so a route that stopped declaring a scope
-    /// retires its old binding while a binding another router still
-    /// needs is never touched. A retired binding keeps a tombstone
-    /// rather than disappearing: an adapter detached by the republish
-    /// — already bound against the retired surface — fails closed on
-    /// its next resolve instead of falling back to the unscoped slot,
-    /// until a live binding reclaims the surface. A surface another
-    /// owner already bound to a different scope refuses the whole
-    /// publish too: resolution could never tell the two declarations
-    /// apart, so the conflict dies at declaration.
+    /// every live scoped route's surface and leased mechanism → the
+    /// scope it declared. The table is validated before it lands — a
+    /// scope the host did not authorize, or two bindings pointing at
+    /// different scopes for one key, refuses the whole publish — and
+    /// the swap covers only the owner's own slice, so a route that
+    /// stopped declaring a scope retires its old binding while a
+    /// binding another router still needs is never touched. A retired
+    /// binding keeps a tombstone rather than disappearing: an adapter
+    /// detached by the republish — already bound against the retired
+    /// surface — fails closed on its next resolve instead of falling
+    /// back to the unscoped slot, until a live binding reclaims the
+    /// surface. A surface and mechanism another owner already bound to
+    /// a different scope refuses the whole publish too: resolution
+    /// could never tell the two declarations apart, so the conflict
+    /// dies at declaration.
     pub fn replace_target_scopes<'a>(
         &self,
         owner: ScopeOwner,
-        bindings: impl IntoIterator<Item = (&'a ServiceTarget, &'a str)>,
+        bindings: impl IntoIterator<Item = (&'a ServiceTarget, &'a str, ProviderCredential)>,
     ) -> Result<()> {
         let mut table = BTreeMap::new();
         {
             let authorizations = lock(&self.authorizations);
-            for (target, scope) in bindings {
+            for (target, scope, kind) in bindings {
                 if !authorizations.contains_key(scope) {
                     return Err(Error::Credential(
                         "credential_scope_unauthorized".to_owned(),
                     ));
                 }
-                match table.entry(target_key(target)) {
+                match table.entry(binding_key(target, kind)) {
                     Entry::Vacant(entry) => {
                         entry.insert(scope.to_owned());
                     }
@@ -529,13 +548,13 @@ impl Leases {
                 return Err(Error::Credential("credential_scope_conflict".to_owned()));
             }
         }
-        // The swap covers the owner's whole slice: a surface absent from
-        // the new table keeps a tombstone, a surface bound to the same
+        // The swap covers the owner's whole slice: a binding absent from
+        // the new table keeps a tombstone, a binding kept on the same
         // scope keeps its generation — the publish changed nothing it
-        // stands for — and a new, tombstoned or rescoped surface mints
-        // a fresh generation, so a resolver pinned to the earlier
-        // binding fails the next resolution even when the same
-        // surface-and-scope pair came back.
+        // stands for — and a new, tombstoned, rescoped or re-mechanismed
+        // binding mints a fresh generation, so a resolver pinned to the
+        // earlier binding fails the next resolution even when the same
+        // surface-and-scope pair came back under another mechanism.
         let slice = live.entry(owner).or_default();
         let previous = std::mem::take(slice);
         for (key, scope) in table {
@@ -676,13 +695,16 @@ impl ScopedResolver {
         auth: &AuthKind,
     ) -> Self {
         let target = target_key(target);
-        let generation = leases.binding_generation(owner, &target).unwrap_or(0);
+        let kind = ProviderCredential::for_auth(auth);
+        let generation = kind
+            .and_then(|kind| leases.binding_generation(owner, &(target.clone(), kind)))
+            .unwrap_or(0);
         Self {
             leases,
             owner,
             scope: scope.into(),
             target,
-            kind: ProviderCredential::for_auth(auth),
+            kind,
             generation,
         }
     }
@@ -707,18 +729,19 @@ impl CredentialResolver for ScopedResolver {
 
 impl Leases {
     /// The live scope one surface's bindings name across every owner's
-    /// table: `None` when no live binding claims it, `Some(scope)` when
-    /// exactly one does. A tombstoned surface with no live claim refuses
-    /// `credential_scope_retired` rather than falling back to the
-    /// unscoped slot, and two owners naming different scopes refuse
-    /// `credential_scope_conflict` — resolution could never tell them
-    /// apart.
+    /// table for the requested mechanism: `None` when no live binding
+    /// claims it, `Some(scope)` when exactly one does. A tombstoned
+    /// binding with no live claim refuses `credential_scope_retired`
+    /// rather than falling back to the unscoped slot, and two owners
+    /// naming different scopes refuse `credential_scope_conflict` —
+    /// resolution could never tell them apart.
     fn bound_scope(
         &self,
         target: &ServiceTarget,
+        kind: ProviderCredential,
     ) -> std::result::Result<Option<String>, a4mp::Error> {
         let tables = lock(&self.target_scopes);
-        let key = target_key(target);
+        let key = binding_key(target, kind);
         let mut found = BTreeSet::new();
         let mut retired = false;
         for table in tables.values() {
@@ -745,7 +768,7 @@ impl Leases {
     /// The generation of `owner`'s live binding for `key`, or `None`
     /// when no live binding covers it — what a [`ScopedResolver`] pins,
     /// so a retire-and-republish of the same surface stays refused.
-    fn binding_generation(&self, owner: ScopeOwner, key: &str) -> Option<u64> {
+    fn binding_generation(&self, owner: ScopeOwner, key: &BindingKey) -> Option<u64> {
         lock(&self.target_scopes)
             .get(&owner)?
             .get(key)?
@@ -781,14 +804,14 @@ impl Leases {
                 "credential_scope_mismatch".to_owned(),
             ));
         }
-        let bound = {
+        let bound = kind.and_then(|kind| {
             let tables = lock(&self.target_scopes);
             tables
                 .get(&owner)
-                .and_then(|slice| slice.get(target))
+                .and_then(|slice| slice.get(&(target.to_owned(), kind)))
                 .cloned()
                 .flatten()
-        };
+        });
         match bound {
             Some(binding) if binding.scope != declared => Err(a4mp::Error::Credential(
                 "credential_scope_conflict".to_owned(),
@@ -879,7 +902,12 @@ impl CredentialResolver for Leases {
         if matches!(scope.auth, AuthKind::None) {
             return Ok(Credential::None);
         }
-        let scoped = self.bound_scope(scope.target)?;
+        let scoped = match ProviderCredential::for_auth(scope.auth) {
+            Some(kind) => self.bound_scope(scope.target, kind)?,
+            // A mechanism custody cannot answer never touches the table —
+            // `resolve_kind` names the refusal.
+            None => None,
+        };
         self.resolve_kind(scoped, &scope)
     }
 }

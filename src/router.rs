@@ -271,6 +271,11 @@ enum Declaration {
 struct ScopedBinding {
     scope: String,
     target: ServiceTarget,
+    /// The leased mechanism the route declared — part of the binding's
+    /// identity: rebinding the same surface and scope under another
+    /// mechanism is a different binding, and the retired mechanism's
+    /// generation dies with its last route.
+    kind: ProviderCredential,
 }
 
 /// A resolved route: the bound adapter and what the upstream call is for.
@@ -656,7 +661,26 @@ impl Router {
         let mut scopes = self.scopes.clone();
         match scope {
             Some(scope) => {
-                scopes.insert(model.clone(), ScopedBinding { scope, target });
+                let auth = match &declaration {
+                    Declaration::Profile(route) => &route.auth,
+                    Declaration::Endpoint(route) => &route.auth,
+                };
+                let Some(kind) = ProviderCredential::for_auth(auth) else {
+                    return Err(Error::Route {
+                        model,
+                        reason: "credentialScope binds leased mechanisms \
+                                 (api-key, bearer)"
+                            .to_owned(),
+                    });
+                };
+                scopes.insert(
+                    model.clone(),
+                    ScopedBinding {
+                        scope,
+                        target,
+                        kind,
+                    },
+                );
             }
             None => {
                 scopes.remove(&model);
@@ -698,7 +722,7 @@ impl Router {
                 self.scope_owner,
                 scopes
                     .values()
-                    .map(|binding| (&binding.target, binding.scope.as_str())),
+                    .map(|binding| (&binding.target, binding.scope.as_str(), binding.kind)),
             )
             .map_err(|error| error.to_string())
     }
@@ -788,7 +812,26 @@ impl Router {
             };
             match scope {
                 Some(scope) => {
-                    scopes.insert(model.clone(), ScopedBinding { scope, target });
+                    let auth = match &declaration {
+                        Declaration::Profile(route) => &route.auth,
+                        Declaration::Endpoint(route) => &route.auth,
+                    };
+                    let Some(kind) = ProviderCredential::for_auth(auth) else {
+                        return Err(Error::Route {
+                            model,
+                            reason: "credentialScope binds leased mechanisms \
+                                     (api-key, bearer)"
+                                .to_owned(),
+                        });
+                    };
+                    scopes.insert(
+                        model.clone(),
+                        ScopedBinding {
+                            scope,
+                            target,
+                            kind,
+                        },
+                    );
                 }
                 None => {
                     scopes.remove(&model);
@@ -851,6 +894,12 @@ impl Router {
     /// The credential scope a declared route named, for projections.
     pub fn credential_scope(&self, model: &str) -> Option<&str> {
         self.scopes.get(model).map(|binding| binding.scope.as_str())
+    }
+
+    /// The provider catalog the router binds through, for read-only
+    /// discovery projections.
+    pub fn catalog(&self) -> &a4mp::Catalog {
+        self.client.catalog()
     }
 
     /// The host-bound adapters, for read-only projections.
@@ -937,6 +986,12 @@ impl Router {
             None => Arc::clone(&self.resolver),
         };
         let adapter = bind(resolver)?;
+        // The serving bind's output gets the same surface checks the
+        // declaration bind's did — on every declared route, scoped or
+        // not. A factory that passed declaration on an https surface and
+        // serves from a cleartext-public or credential-bearing one is
+        // refused here rather than at first forward.
+        check_bound_surface(adapter.target(), auth)?;
         if let Some(binding) = binding
             && target_key(adapter.target()) != target_key(&binding.target)
         {
