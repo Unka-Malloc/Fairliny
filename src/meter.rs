@@ -123,12 +123,15 @@ struct Admissions {
     path: Option<PathBuf>,
     counters: Counters,
     /// Admissions applied since the counters document last reached the
-    /// file — the coalescing counter behind [`PERSIST_EVERY`].
+    /// file — the coalescing counter behind [`PERSIST_EVERY`]. Cleared
+    /// only after a commit, so a failed write leaves the batch pending
+    /// for the next flush rather than dropping it.
     pending: u64,
-    /// When the file was last written, or `None` while the in-memory
-    /// state never persisted. A failed write also marks it — retrying on
-    /// the next window bounds the cost of a permanently failing target.
+    /// When the file was last written — a commit, not an attempt.
     persisted_at: Option<Instant>,
+    /// When a write was last attempted, commit or failure — the cadence
+    /// limits retries of a permanently failing target too.
+    attempted_at: Option<Instant>,
 }
 
 impl Admissions {
@@ -145,6 +148,7 @@ impl Admissions {
             counters,
             pending: 0,
             persisted_at: None,
+            attempted_at: None,
         })
     }
 
@@ -155,6 +159,7 @@ impl Admissions {
             counters: Counters::default(),
             pending: 0,
             persisted_at: None,
+            attempted_at: None,
         }
     }
 
@@ -180,28 +185,49 @@ impl Admissions {
     }
 
     /// Whether the counters file is due a rewrite: the first admission
-    /// persists at once, later ones coalesce by count or by interval.
+    /// persists at once, later ones coalesce by count or by interval
+    /// since the last attempt — a failed write counts as an attempt, so
+    /// retrying a permanently failing target stays rate-limited.
     fn persist_due(&self) -> bool {
         self.pending > 0
-            && (self.persisted_at.is_none()
+            && (self.attempted_at.is_none()
                 || self.pending >= PERSIST_EVERY
                 || self
-                    .persisted_at
+                    .attempted_at
                     .is_some_and(|at| at.elapsed() >= PERSIST_INTERVAL))
     }
 
     /// Rewrite the counters document if admissions are outstanding — the
     /// shutdown and exposition flush, where the interval does not apply.
+    /// The document stays inside the same byte bound the read and the
+    /// atomic write apply: folding and the retention window bound
+    /// cardinality, not bytes, so days drop oldest until the serialized
+    /// counters fit — a supported counter set can never serialize into a
+    /// document the file would only reject. `pending` clears after the
+    /// commit lands, never before: a failed write keeps the batch
+    /// outstanding for the next flush.
     fn persist(&mut self) -> Result<()> {
-        self.pending = 0;
-        self.persisted_at = Some(Instant::now());
+        self.attempted_at = Some(Instant::now());
         let Some(path) = &self.path else {
+            self.pending = 0;
             return Ok(());
         };
-        let encoded = serde_json::to_string(&self.counters)
+        let mut encoded = serde_json::to_string(&self.counters)
             .map_err(|error| Error::Meter(format!("counters encode: {error}")))?;
+        while encoded.len() > MAX_COUNTERS_BYTES && self.counters.days.pop_first().is_some() {
+            encoded = serde_json::to_string(&self.counters)
+                .map_err(|error| Error::Meter(format!("counters encode: {error}")))?;
+        }
+        if encoded.len() > MAX_COUNTERS_BYTES {
+            return Err(Error::Meter(
+                "counters exceed the document bound".to_owned(),
+            ));
+        }
         collection_store::fs::atomic_write_private_text_bounded(path, &encoded, MAX_COUNTERS_BYTES)
-            .map_err(|error| Error::Meter(format!("counters persist: {error}")))
+            .map_err(|error| Error::Meter(format!("counters persist: {error}")))?;
+        self.pending = 0;
+        self.persisted_at = Some(Instant::now());
+        Ok(())
     }
 
     /// The counters as the export document — serialized through the pinned
@@ -247,7 +273,7 @@ fn label(text: &str) -> String {
 /// The metering middleware: one admission counter plus one settlement
 /// hook, both fault-isolated from the forward path.
 pub struct Meter {
-    admissions: Mutex<Admissions>,
+    admissions: Arc<Mutex<Admissions>>,
     journal: Option<Arc<Mutex<UsageSourceHost>>>,
     admission: Option<SourceAdmission>,
     sequence: AtomicU64,
@@ -302,7 +328,7 @@ impl Meter {
             host.admit_source(binding, SettlementEligibility::SettlementEligible)
         };
         Ok(Self {
-            admissions: Mutex::new(admissions),
+            admissions: Arc::new(Mutex::new(admissions)),
             journal: Some(host),
             admission: Some(admission),
             sequence: AtomicU64::new(0),
@@ -315,7 +341,7 @@ impl Meter {
     /// exports; settlement has nowhere to go and declines quietly.
     pub fn unmetered() -> Self {
         Self {
-            admissions: Mutex::new(Admissions::in_memory()),
+            admissions: Arc::new(Mutex::new(Admissions::in_memory())),
             journal: None,
             admission: None,
             sequence: AtomicU64::new(0),
@@ -324,17 +350,33 @@ impl Meter {
     }
 
     /// The request-admission hook: count the request the gateway just
-    /// accepted for forwarding. Synchronous and infallible — a counter
-    /// failure is a persistence bug, never a reason to drop traffic, and
-    /// a persistence failure lands in `failures` rather than silently
+    /// accepted for forwarding. Infallible — a counter failure is a
+    /// persistence bug, never a reason to drop traffic, and a
+    /// persistence failure lands in `failures` rather than silently
     /// leaving the file stale.
-    pub fn admit_request(&self, agent: &str, model: &str) {
-        let Ok(mut admissions) = self.admissions.lock() else {
-            self.failures.fetch_add(1, Ordering::SeqCst);
-            return;
-        };
-        admissions.record(agent, model);
-        if admissions.persist_due() && admissions.persist().is_err() {
+    ///
+    /// The lock and the file write run on the blocking pool, not the
+    /// caller's task: a slow filesystem or a lock held through a
+    /// persist can never stall the forwards, stream frames and cancels
+    /// sharing the runtime. The `Mutex` stays the single writer and
+    /// commit order stays the lock's.
+    pub async fn admit_request(&self, agent: &str, model: &str) {
+        let admissions = Arc::clone(&self.admissions);
+        let agent = agent.to_owned();
+        let model = model.to_owned();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let Ok(mut admissions) = admissions.lock() else {
+                return Err(());
+            };
+            admissions.record(&agent, &model);
+            if admissions.persist_due() {
+                admissions.persist().map_err(|_| ())
+            } else {
+                Ok(())
+            }
+        })
+        .await;
+        if !matches!(outcome, Ok(Ok(()))) {
             self.failures.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -342,13 +384,22 @@ impl Meter {
     /// Persist the counters when admissions are outstanding — the
     /// shutdown and exposition flush, beside the settlement-task drain
     /// in `Service::flush_metering`. A failed write is a metering
-    /// failure like any other: counted, never propagated.
-    pub fn flush(&self) {
-        let Ok(mut admissions) = self.admissions.lock() else {
-            self.failures.fetch_add(1, Ordering::SeqCst);
-            return;
-        };
-        if admissions.pending > 0 && admissions.persist().is_err() {
+    /// failure like any other: counted, never propagated. Runs on the
+    /// blocking pool like the admission hook.
+    pub async fn flush(&self) {
+        let admissions = Arc::clone(&self.admissions);
+        let outcome = tokio::task::spawn_blocking(move || {
+            let Ok(mut admissions) = admissions.lock() else {
+                return Err(());
+            };
+            if admissions.pending > 0 {
+                admissions.persist().map_err(|_| ())
+            } else {
+                Ok(())
+            }
+        })
+        .await;
+        if !matches!(outcome, Ok(Ok(()))) {
             self.failures.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -368,7 +419,7 @@ impl Meter {
             // and an uninstalled journal declines rather than fabricates.
             return;
         };
-        let settled = (|| -> Result<()> {
+        let settled: Result<()> = async {
             let namespace = format!("{}.usage", provider.to_ascii_lowercase());
             let mapping = ProviderMapping::new(namespace.clone(), Quality::Reported)
                 .map_err(|failure| Error::Meter(failure.code.to_string()))?;
@@ -409,13 +460,25 @@ impl Meter {
                 .binding()
                 .bind_observation(observation, None)
                 .map_err(|failure| Error::Meter(failure.code.to_string()))?;
-            let mut host = journal
-                .lock()
-                .map_err(|_| Error::Meter("journal lock poisoned".to_owned()))?;
-            host.admit_observation(admission, &bound)
-                .map_err(|error| Error::Meter(error.to_string()))?;
-            Ok(())
-        })();
+            // The ledger write is blocking work — a file flush or a
+            // lock held through another commit would stall this task's
+            // runtime thread — so the single-writer lock and the commit
+            // run on the blocking pool. Commit order stays the lock's;
+            // observation ids carry the sequence the caller assigned.
+            let journal = Arc::clone(journal);
+            let admission = admission.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut host = journal
+                    .lock()
+                    .map_err(|_| Error::Meter("journal lock poisoned".to_owned()))?;
+                host.admit_observation(&admission, &bound)
+                    .map_err(|error| Error::Meter(error.to_string()))
+            })
+            .await
+            .map_err(|join| Error::Meter(format!("journal task: {join}")))?
+            .map(|_| ())
+        }
+        .await;
         if settled.is_err() {
             self.failures.fetch_add(1, Ordering::SeqCst);
         }

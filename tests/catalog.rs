@@ -435,12 +435,8 @@ async fn catalog_refresh_runs_beside_the_serve_loop() {
     let sync = CatalogSync::new(dir.path())
         .expect("sync")
         .with_source(source)
-        .with_client(
-            reqwest::Client::builder()
-                .no_proxy()
-                .build()
-                .expect("client"),
-        );
+        .with_client_builder(reqwest::Client::builder().no_proxy())
+        .expect("client");
     let service = service_with(Some(sync));
 
     let (mut requests, input) = tokio::io::duplex(4096);

@@ -570,7 +570,7 @@ impl Router {
         let adapter = self
             .bind_profile(route, declaration_resolver())
             .map_err(refuse)?;
-        check_bound_surface(adapter.target(), &route.auth).map_err(refuse)?;
+        check_bound_surface(adapter.target()).map_err(refuse)?;
         self.check_scope_resolver(scope).map_err(refuse)?;
         Ok(adapter.target().clone())
     }
@@ -618,7 +618,7 @@ impl Router {
         let adapter = self
             .bind_endpoint(route, declaration_resolver())
             .map_err(refuse)?;
-        check_bound_surface(adapter.target(), &route.auth).map_err(refuse)?;
+        check_bound_surface(adapter.target()).map_err(refuse)?;
         self.check_scope_resolver(scope).map_err(refuse)?;
         Ok(adapter.target().clone())
     }
@@ -991,7 +991,7 @@ impl Router {
         // not. A factory that passed declaration on an https surface and
         // serves from a cleartext-public or credential-bearing one is
         // refused here rather than at first forward.
-        check_bound_surface(adapter.target(), auth)?;
+        check_bound_surface(adapter.target())?;
         if let Some(binding) = binding
             && target_key(adapter.target()) != target_key(&binding.target)
         {
@@ -1031,7 +1031,7 @@ impl Router {
         let target = profile
             .try_target_for(&protocol, route.region.as_deref(), &bind_vars(&route.vars))
             .map_err(|error| error.to_string())?;
-        check_cleartext_policy(&target.base_url, &route.auth)?;
+        check_cleartext_policy(&target.base_url)?;
         self.client
             .catalog()
             .bind(
@@ -1053,7 +1053,7 @@ impl Router {
         route: &EndpointRoute,
         resolver: Arc<dyn CredentialResolver>,
     ) -> std::result::Result<Arc<dyn Adapter>, String> {
-        check_cleartext_policy(&route.base_url, &route.auth)?;
+        check_cleartext_policy(&route.base_url)?;
         self.client
             .catalog()
             .bind(
@@ -1162,11 +1162,11 @@ fn check_base_url(url: &Url) -> std::result::Result<(), String> {
 }
 
 /// The surface a bound adapter reports must pass the same checks the
-/// declared input passed — a bare base and the cleartext-credential
-/// policy. The declaration registers this target and scoped credentials
-/// flow to it, so a transforming custom factory can never land the
-/// credential on a surface the declaration would have refused.
-fn check_bound_surface(target: &ServiceTarget, auth: &AuthKind) -> std::result::Result<(), String> {
+/// declared input passed — a bare base and the cleartext policy. The
+/// declaration registers this target and scoped credentials flow to it,
+/// so a transforming custom factory can never land the credential on a
+/// surface the declaration would have refused.
+fn check_bound_surface(target: &ServiceTarget) -> std::result::Result<(), String> {
     if !bare_base(&target.base_url) {
         return Err(
             "the adapter's bound target must be an http(s) URL with a host and no \
@@ -1174,56 +1174,36 @@ fn check_bound_surface(target: &ServiceTarget, auth: &AuthKind) -> std::result::
                 .to_owned(),
         );
     }
-    check_cleartext_policy(&target.base_url, auth)
+    check_cleartext_policy(&target.base_url)
 }
 
-/// The cleartext policy a4mp 0.4.0 applies to every profile endpoint
-/// (`a4mp::catalog::check_endpoint_url` and
-/// `check_cleartext_credential_policy`, both private, enforced inside
-/// `Client::bind_provider_with` but not `Catalog::bind`), restated once
-/// for the explicit-target binds every route resolution runs:
+/// The cleartext policy every route binds under — tighter than a4mp
+/// 0.4.0's private-authority rule, which trusted address
+/// classifications this layer cannot: a private, link-local or CGNAT
+/// literal is still a network hop, and an `.internal` suffix proves
+/// neither private DNS resolution nor peer identity. Cleartext traffic
+/// carries prompts, responses and — on credentialed routes — live
+/// leased keys, so `http` is confined to the one authority class whose
+/// peer cannot sit off this host, and even that rides the direct,
+/// proxy-free client [`crate::transport`] issues:
 ///
-/// - `https` binds anywhere;
-/// - `http` binds only toward a private or loopback authority —
-///   `localhost`, `*.localhost`, `*.internal`, or a loopback, private,
-///   link-local or CGNAT IP literal;
-/// - a credential-bearing `http` bind (every auth kind but `None`) is
-///   further confined to a literal authority — a private/loopback IP
-///   literal or `localhost`/`*.localhost` — because a named private host
-///   resolves through DNS and can answer a public address;
+/// - `https` binds anywhere — the peer is authenticated by verified TLS;
+/// - `http` binds only toward a loopback authority — `localhost`,
+///   `*.localhost`, or a loopback IP literal — whatever the auth kind;
 /// - any other scheme is refused.
-fn check_cleartext_policy(url: &Url, auth: &AuthKind) -> std::result::Result<(), String> {
-    let literal = |domain: &str| domain == "localhost" || domain.ends_with(".localhost");
-    let (private, literal_private) = match url.host() {
-        Some(url::Host::Domain(domain)) => (
-            literal(domain) || domain.ends_with(".internal"),
-            literal(domain),
-        ),
-        Some(url::Host::Ipv4(ip)) => {
-            let private = ip.is_loopback()
-                || ip.is_private()
-                || ip.is_link_local()
-                || (ip.octets()[0] == 100 && (ip.octets()[1] & 0xC0) == 0x40);
-            (private, private)
-        }
-        Some(url::Host::Ipv6(ip)) => {
-            let private = ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local();
-            (private, private)
-        }
-        None => (false, false),
+fn check_cleartext_policy(url: &Url) -> std::result::Result<(), String> {
+    let loopback = match url.host() {
+        Some(url::Host::Domain(domain)) => domain == "localhost" || domain.ends_with(".localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
     };
     match url.scheme() {
         "https" => Ok(()),
-        "http" if !private => Err("endpoint uses cleartext http to a public host — the \
-             endpoint must be https or a private/loopback authority \
-             (localhost, a loopback/private/link-local IP, or an .internal name)"
+        "http" if !loopback => Err("endpoint uses cleartext http to a non-loopback \
+             authority — the endpoint must be https, or http only toward a \
+             loopback authority (localhost or a loopback IP literal)"
             .to_owned()),
-        "http" if !literal_private && !matches!(auth, AuthKind::None) => {
-            Err("endpoint is cleartext http to a resolved name — a \
-                 credential-bearing bind requires https or a literal \
-                 private/loopback authority (an IP literal or localhost)"
-                .to_owned())
-        }
         "http" => Ok(()),
         _ => Err("endpoint must be an http(s) URL".to_owned()),
     }
@@ -1475,7 +1455,7 @@ mod tests {
         // half-parsed route, never a default the document did not declare.
         for entry in [
             serde_json::json!({"provider": "ollama"}),
-            serde_json::json!({"model": "m", "provider": "ollama", "auth": "oauth-magic"}),
+            serde_json::json!({"model": "m", "provider": "ollama", "auth": format!("oauth-{}", uuid::Uuid::new_v4())}),
             serde_json::json!({"model": "m", "provider": "ollama", "protocol": "grpc"}),
             serde_json::json!({"model": "m", "provider": "ollama", "auth": 5}),
             serde_json::json!({"model": "m", "provider": "ollama", "upstreamModel": 5}),
@@ -1667,7 +1647,7 @@ mod tests {
         );
         host_router
             .load_routes(&serde_json::json!({"routes": [
-                {"model": "m", "provider": "bedrock", "auth": "cloud:aws"}
+                {"model": "m", "provider": "bedrock", "auth": format!("cloud:{}", uuid::Uuid::new_v4())}
             ]}))
             .expect("host resolver answers cloud identity");
         assert!(host_router.resolve("m").is_ok());
@@ -1826,25 +1806,29 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_routes_keep_a4mps_cleartext_credential_policy() {
-        let check =
-            |url: &str, auth: AuthKind| check_cleartext_policy(&Url::parse(url).expect(url), &auth);
+    fn cleartext_endpoints_stay_on_the_loopback() {
+        let check = |url: &str| check_cleartext_policy(&Url::parse(url).expect(url));
         // https binds anywhere, with or without credentials.
-        assert!(check("https://api.vendor.example/v1", AuthKind::ApiKey).is_ok());
+        assert!(check("https://api.vendor.example/v1").is_ok());
         // Cleartext to a public host is refused whatever the auth.
-        assert!(check("http://api.vendor.example/v1", AuthKind::ApiKey).is_err());
-        assert!(check("http://api.vendor.example/v1", AuthKind::None).is_err());
-        assert!(check("http://8.8.8.8/v1", AuthKind::None).is_err());
-        // Credentials may cross cleartext only to a literal authority.
-        assert!(check("http://127.0.0.1:8080/v1", AuthKind::ApiKey).is_ok());
-        assert!(check("http://[::1]:8080/v1", AuthKind::Bearer).is_ok());
-        assert!(check("http://10.0.0.7/v1", AuthKind::Bearer).is_ok());
-        assert!(check("http://localhost:11434", AuthKind::ApiKey).is_ok());
-        assert!(check("http://gpu.localhost:11434", AuthKind::ApiKey).is_ok());
-        // A named private host resolves through DNS: no cleartext
-        // credentials, but a credential-free bind is fine.
-        assert!(check("http://models.internal:11434", AuthKind::ApiKey).is_err());
-        assert!(check("http://models.internal:11434", AuthKind::None).is_ok());
+        assert!(check("http://api.vendor.example/v1").is_err());
+        assert!(check("http://8.8.8.8/v1").is_err());
+        // Only a loopback authority accepts cleartext.
+        assert!(check("http://127.0.0.1:8080/v1").is_ok());
+        assert!(check("http://[::1]:8080/v1").is_ok());
+        assert!(check("http://localhost:11434").is_ok());
+        assert!(check("http://gpu.localhost:11434").is_ok());
+        // Every other cleartext authority refuses, credentialed or not:
+        // an address class is not authentication — a private, link-local
+        // or CGNAT literal is still a network hop, and a private-suffix
+        // name does not prove the resolved peer stays inside the host.
+        assert!(check("http://10.0.0.7/v1").is_err());
+        assert!(check("http://192.168.1.10/v1").is_err());
+        assert!(check("http://169.254.1.1/v1").is_err());
+        assert!(check("http://100.64.0.1/v1").is_err());
+        assert!(check("http://[fd00::1]/v1").is_err());
+        assert!(check("http://[fe80::1]/v1").is_err());
+        assert!(check("http://models.internal:11434").is_err());
         // The policy runs in the declaration bind.
         let error = declare(serde_json::json!({
             "model": "m",
@@ -1852,7 +1836,7 @@ mod tests {
             "auth": "api-key",
             "credentialScope": "vendor-scope"
         }))
-        .expect_err("cleartext credentials to a resolved name");
+        .expect_err("cleartext to a non-loopback authority refuses");
         assert!(error.to_string().contains("cleartext"), "{error}");
     }
 }

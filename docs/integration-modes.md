@@ -185,11 +185,12 @@ The routes document is one object:
   its paths onto — `…/v1` for the OpenAI families (`chat/completions`,
   `responses`), the host root for `anthropic-messages` (`v1/messages`).
   It must be `http(s)` with a host and no embedded credentials, query or
-  fragment, and it keeps a4mp's cleartext policy for profile endpoints:
-  `https` anywhere; `http` only to `localhost`, `*.localhost`,
-  `*.internal` or a loopback/private/link-local IP; and with any
-  `auth` but `none`, `http` only to a private/loopback IP literal or
-  `localhost`/`*.localhost`. The entry takes no top-level `protocol`,
+  fragment, under the gateway's cleartext policy: `https` anywhere;
+  `http` only to a loopback authority — `localhost`, `*.localhost` or a
+  loopback IP literal — whatever the `auth`, and even that rides a
+  proxy-free direct client. Private, link-local and CGNAT addresses and
+  private-suffix names (such as `*.internal`) are network hops, so they
+  require `https`. The entry takes no top-level `protocol`,
   `region` or `vars`. Its `auth` is limited to the leased mechanisms —
   `none`, `api-key`, `bearer`: the sidecar's lease resolver cannot
   answer `cloud:*` or `external:*`, so an endpoint route naming one is

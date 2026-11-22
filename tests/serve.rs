@@ -745,13 +745,31 @@ async fn settlement_tracking_stays_bounded_across_forwards() {
         service
             .dispatch(serde_json::json!(1), Some("chat.complete"), &params)
             .await;
-        // Let the settlement task settle, then confirm the reaper keeps
-        // the tracked set proportional to live work — never one retained
-        // task per forwarded request.
-        tokio::task::yield_now().await;
+        // The reaper keeps the tracked set proportional to live work —
+        // never one retained task per forwarded request. A settle spans
+        // a blocking-pool hop of real I/O and finished tasks only leave
+        // the set when a dispatch reaps them, so drive light dispatches
+        // until the real work drains — bounded by a deadline, not a set
+        // size at one instant.
+        let converged = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                service
+                    .dispatch(
+                        serde_json::json!(null),
+                        Some("models.list"),
+                        &serde_json::json!({}),
+                    )
+                    .await;
+                if service.settle_len() <= 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await;
         assert!(
-            service.settle_len() <= 1,
-            "settlement set stays bounded: {}",
+            converged.is_ok(),
+            "settlement set drains with the work: {}",
             service.settle_len()
         );
     }
@@ -875,7 +893,8 @@ fn the_routes_document_refuses_malformed_entries_and_loads_well_formed_ones() {
     assert!(
         router
             .load_routes(&serde_json::json!({
-                "routes": [{"model": "chat", "provider": "ollama", "auth": "oauth-magic"}]
+                "routes": [{"model": "chat", "provider": "ollama",
+                            "auth": format!("oauth-{}", uuid::Uuid::new_v4())}]
             }))
             .is_err()
     );
@@ -904,7 +923,7 @@ fn the_routes_document_refuses_malformed_entries_and_loads_well_formed_ones() {
                 "upstreamModel": "llama3.1",
                 "protocol": "other:ollama",
                 "auth": "none",
-                "vars": {"endpoint": "http://models.internal:11434"}
+                "vars": {"endpoint": "http://localhost:11434"}
             }]
         }))
         .expect("routes");
@@ -913,11 +932,11 @@ fn the_routes_document_refuses_malformed_entries_and_loads_well_formed_ones() {
     assert_eq!(bound.provider.as_str(), "ollama");
 }
 
-#[test]
-fn meter_open_over_a_fresh_state_root_persists_admissions() {
+#[tokio::test]
+async fn meter_open_over_a_fresh_state_root_persists_admissions() {
     let dir = tempfile::tempdir().expect("tempdir");
     let meter = Meter::open(dir.path()).expect("meter");
-    meter.admit_request("agent", "model");
+    meter.admit_request("agent", "model").await;
     // The first admission persists at once so the file materializes early.
     let document = serde_json::to_value(meter.usage_document().expect("counters document"))
         .expect("document json");
@@ -1762,19 +1781,21 @@ async fn each_scoped_route_resolves_only_the_credentials_its_host_authorized() {
     let (addr_b, upstream_b) = mock_upstream(openai_reply());
     let id_a = uuid::Uuid::new_v4().to_string();
     let id_b = uuid::Uuid::new_v4().to_string();
+    let scope_a = uuid::Uuid::new_v4().to_string();
+    let scope_b = uuid::Uuid::new_v4().to_string();
     let leases = scoped_leases(&[
-        (&id_a, b"key-for-vendor-a", "vendor-a"),
-        (&id_b, b"key-for-vendor-b", "vendor-b"),
+        (&id_a, b"key-for-vendor-a", &scope_a),
+        (&id_b, b"key-for-vendor-b", &scope_b),
     ]);
     let mut router = Router::with_leases(loopback_transport(), leases);
     router
         .load_routes(&serde_json::json!({"routes": [
             {"model": "a-chat",
              "endpoint": {"baseUrl": format!("http://{addr_a}/v1"), "protocol": "openai-chat-completions"},
-             "auth": "api-key", "credentialScope": "vendor-a"},
+             "auth": "api-key", "credentialScope": scope_a},
             {"model": "b-chat",
              "endpoint": {"baseUrl": format!("http://{addr_b}/v1"), "protocol": "openai-chat-completions"},
-             "auth": "api-key", "credentialScope": "vendor-b"}
+             "auth": "api-key", "credentialScope": scope_b}
         ]}))
         .expect("routes");
     let service = Service::new(router, Meter::unmetered());
@@ -1808,8 +1829,9 @@ async fn a_scope_whose_credential_the_handoff_lacks_fails_closed() {
     });
     let epoch_id = epoch.current.lock().unwrap().clone();
     let leases = Arc::new(Leases::disconnected());
+    let scope = uuid::Uuid::new_v4().to_string();
     leases
-        .authorize_scope("vendor-scope", [&ghost_id])
+        .authorize_scope(&scope, [&ghost_id])
         .expect("authorize");
     leases
         .install_handoff(
@@ -1822,7 +1844,7 @@ async fn a_scope_whose_credential_the_handoff_lacks_fails_closed() {
         .load_routes(&serde_json::json!({"routes": [{
             "model": "vendor-chat",
             "endpoint": {"baseUrl": format!("http://{addr}/v1"), "protocol": "openai-chat-completions"},
-            "auth": "api-key", "credentialScope": "vendor-scope"
+            "auth": "api-key", "credentialScope": scope
         }]}))
         .expect("declares");
     let service = Service::new(router, Meter::unmetered());
@@ -1856,7 +1878,7 @@ fn a_route_naming_a_scope_the_host_never_authorized_refuses_to_declare() {
         .load_routes(&serde_json::json!({"routes": [{
             "model": "m",
             "endpoint": {"baseUrl": "https://api.vendor.example", "protocol": "openai-chat-completions"},
-            "auth": "api-key", "credentialScope": "misspelled-scope"
+            "auth": "api-key", "credentialScope": uuid::Uuid::new_v4().to_string()
         }]}))
         .expect_err("unauthorized scope");
     assert!(error.to_string().contains("unauthorized"), "{error}");

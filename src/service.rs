@@ -54,10 +54,15 @@ enum InputLine {
     Oversized,
 }
 
-/// Read one request line bounded by `MAX_LINE_BYTES`. The read goes
-/// through a `Take` so a line without a newline can never buffer past
-/// the cap; an oversized line's remainder is then skipped a buffer at a
-/// time, so the discard is bounded too.
+/// Read one request line bounded by `MAX_LINE_BYTES`, resumable across
+/// however many times the serve loop's `select!` cancels and re-calls it.
+/// `line` accumulates what earlier calls already consumed, so the cap is
+/// charged against the whole line — each call's `Take` spends only the
+/// budget the line has left, and a line a cancelled call already judged
+/// oversized stays oversized in `discarding`, its tail skipped rather
+/// than mistaken for a fresh request. EOF only ends the loop when the
+/// buffer is empty: a final line the peer never newline-terminated still
+/// dispatches.
 ///
 /// Async so the loop yields while it waits for input — settlement tasks
 /// stay pollable between requests rather than stalling behind a blocking
@@ -65,30 +70,47 @@ enum InputLine {
 async fn read_capped_line(
     input: &mut (impl AsyncBufRead + Unpin),
     line: &mut Vec<u8>,
+    discarding: &mut bool,
 ) -> std::io::Result<InputLine> {
-    if (&mut *input)
-        .take(MAX_LINE_BYTES as u64 + 1)
-        .read_until(b'\n', line)
-        .await?
-        == 0
-    {
-        return Ok(InputLine::Eof);
+    if !*discarding {
+        // The cap covers the whole line across calls: `line` already
+        // holds what earlier calls consumed, so this `Take` spends only
+        // the budget left. A full buffer with no newline means an
+        // earlier call already read cap-plus-one — oversized now, no
+        // further spend.
+        if line.len() <= MAX_LINE_BYTES {
+            let remaining = (MAX_LINE_BYTES + 1 - line.len()) as u64;
+            if (&mut *input)
+                .take(remaining)
+                .read_until(b'\n', line)
+                .await?
+                == 0
+            {
+                return Ok(if line.is_empty() {
+                    InputLine::Eof
+                } else {
+                    InputLine::Complete
+                });
+            }
+            // A read ending in the newline is at the cap boundary,
+            // anything shorter means a newline arrived in time.
+            if line.len() <= MAX_LINE_BYTES || line.ends_with(b"\n") {
+                return Ok(InputLine::Complete);
+            }
+        }
+        line.clear();
+        *discarding = true;
     }
-    // `Take` spends at most the cap plus one: a full read ending in the
-    // newline is at the cap boundary, anything else means no newline
-    // arrived in time and the line is oversized.
-    if line.len() <= MAX_LINE_BYTES || line.ends_with(b"\n") {
-        return Ok(InputLine::Complete);
-    }
-    line.clear();
     loop {
         let available = input.fill_buf().await?;
         if available.is_empty() {
+            *discarding = false;
             return Ok(InputLine::Oversized);
         }
         match available.iter().position(|byte| *byte == b'\n') {
             Some(position) => {
                 input.consume(position + 1);
+                *discarding = false;
                 return Ok(InputLine::Oversized);
             }
             None => {
@@ -253,8 +275,10 @@ impl Service {
     /// Parse `{dialect, body, agent?}` into the canonical request, resolve
     /// the outward model through the route table, rewrite the model to the
     /// upstream id, and count the admission — all before the task spawns,
-    /// so a refused request never enters the in-flight table.
-    fn prepare_chat(&self, params: &Value) -> Result<PreparedChat> {
+    /// so a refused request never enters the in-flight table. Async for
+    /// the admission hook: its counter persistence runs on the blocking
+    /// pool, off this loop.
+    async fn prepare_chat(&self, params: &Value) -> Result<PreparedChat> {
         let dialect = match params.get("dialect").and_then(Value::as_str) {
             Some("openai-chat-completions") => a4mp::wire::WireDialect::OpenAiChatCompletions,
             Some("openai-responses") => a4mp::wire::WireDialect::OpenAiResponses,
@@ -282,7 +306,7 @@ impl Service {
             .and_then(Value::as_str)
             .unwrap_or("stdio")
             .to_owned();
-        self.meter.admit_request(&agent, &client_model);
+        self.meter.admit_request(&agent, &client_model).await;
         Ok(PreparedChat {
             bound,
             request,
@@ -339,7 +363,7 @@ impl Service {
     /// serve loop, awaited inline for callers that drive dispatch
     /// themselves.
     async fn dispatch_buffered(&self, id: Value, params: &Value) -> Value {
-        let prepared = match self.prepare_chat(params) {
+        let prepared = match self.prepare_chat(params).await {
             Ok(prepared) => prepared,
             Err(error) => return error_reply(id, &error.to_string()),
         };
@@ -390,9 +414,13 @@ impl Service {
         // the wire fails the serve instead of passing silently.
         let mut forward: JoinSet<std::io::Result<()>> = JoinSet::new();
         let mut line = Vec::new();
+        // The resumable read's state across `select!` cancellations:
+        // `line` holds the consumed bytes, `discarding` the oversized
+        // tail skip — a cancelled call resumes exactly where it stopped.
+        let mut discarding = false;
         loop {
             let input_line = tokio::select! {
-                input_line = read_capped_line(&mut input, &mut line) => input_line?,
+                input_line = read_capped_line(&mut input, &mut line, &mut discarding) => input_line?,
                 finished = forward.join_next(), if !forward.is_empty() => {
                     // A finished task observed beside the input wait:
                     // a reply that never landed fails the serve now,
@@ -449,7 +477,7 @@ impl Service {
             let params = request.get("params").cloned().unwrap_or(Value::Null);
             match method {
                 Some("chat.complete") | Some("chat.stream") => {
-                    let prepared = match self.prepare_chat(&params) {
+                    let prepared = match self.prepare_chat(&params).await {
                         Ok(prepared) => prepared,
                         Err(error) => {
                             write_line(&writer, &error_reply(id, &error.to_string())).await?;
@@ -533,7 +561,7 @@ impl Service {
                 self.meter.count_failure();
             }
         }
-        self.meter.flush();
+        self.meter.flush().await;
     }
 
     /// The bound route table as a projection — a config answer, not a
@@ -744,9 +772,9 @@ enum PumpOutcome {
     WriteFailed(std::io::Error),
 }
 
-/// What the pump accumulated while it ran. Lives outside the deadline
-/// future so a fired bound still reports the frames, usage and losses it
-/// already observed.
+/// What the pump accumulated while it ran, reported whatever the
+/// outcome: the frames, usage and losses observed up to a deadline or
+/// an upstream end.
 struct PumpState {
     /// Whether any `stream:"data"` line reached the wire.
     wrote_frame: bool,
@@ -787,13 +815,19 @@ async fn buffered_result(
 }
 
 /// The pump inside the stream task: dialect SSE frames as `stream:"data"`
-/// lines, tracking the last usage event and every encode loss. Returns
-/// how the stream ended; the caller writes the terminal line.
+/// lines, tracking the last usage event and every encode loss. The
+/// host's upstream deadline bounds upstream reads only — the stream open
+/// and every frame wait — at one instant computed here, so local output
+/// waits never count against a healthy upstream and the deadline can
+/// never cancel inside a `write_line` (a half-written NDJSON line would
+/// corrupt every reply that followed it on the wire). Returns how the
+/// stream ended; the caller writes the terminal line.
 async fn pump_frames(
     writer: &SharedWriter,
     id: &Value,
     prepared: PreparedChat,
     state: &mut PumpState,
+    deadline: Option<Duration>,
 ) -> PumpOutcome {
     let PreparedChat {
         bound,
@@ -803,9 +837,25 @@ async fn pump_frames(
         control,
         ..
     } = prepared;
-    let mut events = match bound.adapter.chat_stream(request, &control).await {
-        Ok(events) => events,
-        Err(error) => return PumpOutcome::Ended(error),
+    let deadline_at = deadline.map(|d| tokio::time::Instant::now() + d);
+    /// One upstream wait under the shared deadline instant — input waits
+    /// alone count against it, never output.
+    async fn upstream<T>(
+        deadline_at: Option<tokio::time::Instant>,
+        wait: impl std::future::Future<Output = T>,
+    ) -> std::result::Result<T, PumpOutcome> {
+        match deadline_at {
+            Some(at) => tokio::time::timeout_at(at, wait)
+                .await
+                .map_err(|_| PumpOutcome::Deadline),
+            None => Ok(wait.await),
+        }
+    }
+    let mut events = match upstream(deadline_at, bound.adapter.chat_stream(request, &control)).await
+    {
+        Ok(Ok(events)) => events,
+        Ok(Err(error)) => return PumpOutcome::Ended(error),
+        Err(outcome) => return outcome,
     };
     let mut encoder = a4mp::wire::stream_encoder(dialect, &client_model);
     for frame in encoder.preamble() {
@@ -815,7 +865,15 @@ async fn pump_frames(
         }
     }
     loop {
-        let item = std::future::poll_fn(|cx| Stream::poll_next(events.as_mut(), cx)).await;
+        let item = match upstream(
+            deadline_at,
+            std::future::poll_fn(|cx| Stream::poll_next(events.as_mut(), cx)),
+        )
+        .await
+        {
+            Ok(item) => item,
+            Err(outcome) => return outcome,
+        };
         match item {
             Some(Ok(event)) => {
                 if let a4mp::StreamEvent::Usage(usage) = &event {
@@ -864,13 +922,7 @@ async fn run_stream(
         last_usage: None,
         losses: std::mem::take(&mut prepared.losses),
     };
-    let pump = pump_frames(writer, &id, prepared, &mut state);
-    let outcome = match deadline {
-        Some(d) => tokio::time::timeout(d, pump)
-            .await
-            .unwrap_or(PumpOutcome::Deadline),
-        None => pump.await,
-    };
+    let outcome = pump_frames(writer, &id, prepared, &mut state, deadline).await;
     spawn_settle(meter, settle, provider, state.last_usage);
     let line = match outcome {
         PumpOutcome::Done => end_line(&id, "done", &state.losses, None),
@@ -915,20 +967,30 @@ mod tests {
         bytes.extend_from_slice(b"\n{\"id\":1}\n");
         let mut input = &bytes[..];
         let mut line = Vec::new();
+        let mut discarding = false;
         assert!(matches!(
-            read_capped_line(&mut input, &mut line).await.expect("read"),
+            read_capped_line(&mut input, &mut line, &mut discarding)
+                .await
+                .expect("read"),
             InputLine::Oversized
         ));
         assert!(line.is_empty());
         // The next read starts on the following line — the oversized
         // line's tail did not leak into it.
         assert!(matches!(
-            read_capped_line(&mut input, &mut line).await.expect("read"),
+            read_capped_line(&mut input, &mut line, &mut discarding)
+                .await
+                .expect("read"),
             InputLine::Complete
         ));
         assert_eq!(line, b"{\"id\":1}\n");
+        // The caller takes each completed line, so the buffer is empty
+        // when the next call finds EOF.
+        line.clear();
         assert!(matches!(
-            read_capped_line(&mut input, &mut line).await.expect("read"),
+            read_capped_line(&mut input, &mut line, &mut discarding)
+                .await
+                .expect("read"),
             InputLine::Eof
         ));
 
@@ -937,11 +999,15 @@ mod tests {
         let mut input = &tail[..];
         line.clear();
         assert!(matches!(
-            read_capped_line(&mut input, &mut line).await.expect("read"),
+            read_capped_line(&mut input, &mut line, &mut discarding)
+                .await
+                .expect("read"),
             InputLine::Oversized
         ));
         assert!(matches!(
-            read_capped_line(&mut input, &mut line).await.expect("read"),
+            read_capped_line(&mut input, &mut line, &mut discarding)
+                .await
+                .expect("read"),
             InputLine::Eof
         ));
     }
@@ -954,8 +1020,11 @@ mod tests {
         bytes.push(b'\n');
         let mut input = &bytes[..];
         let mut line = Vec::new();
+        let mut discarding = false;
         assert!(matches!(
-            read_capped_line(&mut input, &mut line).await.expect("read"),
+            read_capped_line(&mut input, &mut line, &mut discarding)
+                .await
+                .expect("read"),
             InputLine::Complete
         ));
         assert_eq!(line.len(), MAX_LINE_BYTES);
@@ -964,14 +1033,83 @@ mod tests {
         line.clear();
         let mut input = &b"final-line-without-newline"[..];
         assert!(matches!(
-            read_capped_line(&mut input, &mut line).await.expect("read"),
+            read_capped_line(&mut input, &mut line, &mut discarding)
+                .await
+                .expect("read"),
             InputLine::Complete
         ));
         assert_eq!(line, b"final-line-without-newline");
+        line.clear();
         assert!(matches!(
-            read_capped_line(&mut input, &mut line).await.expect("read"),
+            read_capped_line(&mut input, &mut line, &mut discarding)
+                .await
+                .expect("read"),
             InputLine::Eof
         ));
+    }
+
+    #[tokio::test]
+    async fn the_cap_is_cumulative_across_resumed_reads() {
+        // Bytes a cancelled call left in `line` still count against the
+        // budget — the cap covers the whole line, so a resumed read can
+        // never let one line grow past it.
+        let mut line = vec![b'x'; MAX_LINE_BYTES - 4];
+        let mut discarding = false;
+        let mut input = &b"12345\nnext\n"[..];
+        // Five more bytes without a newline spend the last of the budget.
+        assert!(matches!(
+            read_capped_line(&mut input, &mut line, &mut discarding)
+                .await
+                .expect("read"),
+            InputLine::Oversized
+        ));
+        assert!(line.is_empty());
+        assert!(matches!(
+            read_capped_line(&mut input, &mut line, &mut discarding)
+                .await
+                .expect("read"),
+            InputLine::Complete
+        ));
+        assert_eq!(line, b"next\n");
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_discard_resumes_skipping() {
+        // A call cancelled mid-skip left `discarding` set: the resumed
+        // call finishes skipping the oversized tail instead of
+        // dispatching it as its own line.
+        let mut line = Vec::new();
+        let mut discarding = true;
+        let mut input = &b"tail-bytes\nnext\n"[..];
+        assert!(matches!(
+            read_capped_line(&mut input, &mut line, &mut discarding)
+                .await
+                .expect("read"),
+            InputLine::Oversized
+        ));
+        assert!(matches!(
+            read_capped_line(&mut input, &mut line, &mut discarding)
+                .await
+                .expect("read"),
+            InputLine::Complete
+        ));
+        assert_eq!(line, b"next\n");
+    }
+
+    #[tokio::test]
+    async fn an_eof_line_still_dispatches_after_a_resumed_read() {
+        // Buffered bytes make a bare EOF a completed line, not the end
+        // of input — EOF only ends the loop on an empty buffer.
+        let mut line = b"partial-line".to_vec();
+        let mut discarding = false;
+        let mut input = &b""[..];
+        assert!(matches!(
+            read_capped_line(&mut input, &mut line, &mut discarding)
+                .await
+                .expect("read"),
+            InputLine::Complete
+        ));
+        assert_eq!(line, b"partial-line");
     }
 
     /// Answers every chat with an empty output — enough to forward.

@@ -152,11 +152,20 @@ impl CatalogSync {
         self
     }
 
-    /// The HTTP client the refresh fetches through; a host that tunes
-    /// its own reqwest settings keeps the same cache semantics.
-    pub fn with_client(mut self, client: reqwest::Client) -> Self {
-        self.client = client;
-        self
+    /// The HTTP client the refresh fetches through, handed over as a
+    /// builder the host pre-tunes (proxies, timeouts, pool limits).
+    /// Redirect and TLS-verification policy stay under the sync's own
+    /// control — the builder is finished with redirects disabled and
+    /// certificate verification enforced, so an injected client can
+    /// never carry the fetch off the configured HTTPS source or accept
+    /// an unverified peer as if it were one.
+    pub fn with_client_builder(mut self, builder: reqwest::ClientBuilder) -> Result<Self> {
+        self.client = builder
+            .redirect(reqwest::redirect::Policy::none())
+            .danger_accept_invalid_certs(false)
+            .build()
+            .map_err(|_| catalog_error("catalog_client_invalid"))?;
+        Ok(self)
     }
 
     /// The schema pin the host expects: a configured source's own pin
@@ -516,15 +525,20 @@ async fn fetch(
         .map_err(|_| catalog_error(REFRESH_FAILED))?;
     match response.status() {
         reqwest::StatusCode::NOT_MODIFIED => Ok(None),
-        reqwest::StatusCode::OK => decode_response(response).await.map(Some),
+        reqwest::StatusCode::OK => decode_response(response, source).await.map(Some),
         _ => Err(catalog_error(REFRESH_FAILED)),
     }
 }
 
-/// A `200` is only fresh when it carries the revision ETag its body
-/// names — the pair the family publishes — and the body stays within
-/// the bound.
-async fn decode_response(response: reqwest::Response) -> Result<Catalog> {
+/// A `200` is only fresh when it answers from the configured source —
+/// the response URL is bound to the HTTPS URL the host configured, so a
+/// client that followed a redirect or a downgrade has nothing accepted —
+/// carries the revision ETag its body names — the pair the family
+/// publishes — and the body stays within the bound.
+async fn decode_response(mut response: reqwest::Response, source: &Url) -> Result<Catalog> {
+    if response.url() != source {
+        return Err(catalog_error(REFRESH_FAILED));
+    }
     let etag = response
         .headers()
         .get(reqwest::header::ETAG)
@@ -538,12 +552,20 @@ async fn decode_response(response: reqwest::Response) -> Result<Catalog> {
     {
         return Err(catalog_error(REFRESH_FAILED));
     }
-    let body = response
-        .bytes()
+    // The Content-Length check is only a fast path: a response without
+    // one — or one that lies — is capped chunk by chunk, and the chunk
+    // that would take the retained body past the bound refuses the
+    // refresh before a byte of it is kept.
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|_| catalog_error(REFRESH_FAILED))?;
-    if body.len() as u64 > MAX_BODY_BYTES {
-        return Err(catalog_error(REFRESH_FAILED));
+        .map_err(|_| catalog_error(REFRESH_FAILED))?
+    {
+        if body.len() as u64 + chunk.len() as u64 > MAX_BODY_BYTES {
+            return Err(catalog_error(REFRESH_FAILED));
+        }
+        body.extend_from_slice(&chunk);
     }
     let catalog: Catalog =
         serde_json::from_slice(&body).map_err(|_| catalog_error(REFRESH_FAILED))?;
