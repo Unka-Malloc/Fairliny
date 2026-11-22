@@ -490,6 +490,23 @@ async fn catalog_refresh_runs_beside_the_serve_loop() {
 }
 
 #[tokio::test]
+async fn a_lost_refresh_reply_fails_the_serve() {
+    // The refresh runs off the stdin loop, but its reply still belongs
+    // on the wire: a write that cannot land fails the serve instead of
+    // reporting a clean exit with the reply lost.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sync = CatalogSync::new(dir.path()).expect("sync");
+    let service = service_with(Some(sync));
+    let (writer, reader) = tokio::io::duplex(64 * 1024);
+    drop(reader);
+    let input = "{\"id\":1,\"method\":\"catalog.refresh\",\"params\":{}}\n";
+    assert!(
+        service.serve(input.as_bytes(), writer).await.is_err(),
+        "a refresh reply that never lands is a serve failure"
+    );
+}
+
+#[tokio::test]
 async fn a_lease_backed_service_serves_discovery_and_catalog_together() {
     // The sidecar's real shape — a lease-backed router plus a
     // configured sync — answers both projections on one dispatch

@@ -40,9 +40,11 @@ JSON reply per stdout line.
   `If-None-Match` under the cached revision, `304` revalidates
   without rewriting the cache, and a failed or invalid fetch keeps
   and reports the last valid catalog. Requires the `catalog` config
-  member `{"cacheDir", "source"?, "schema"?}`; `schema` pins the cache
-  for offline reads too. The refresh runs beside the loop, so its
-  reply may land after later requests' replies — correlate by `id`;
+  member `{"cacheDir", "source"?, "schema"?}`; `schema` pins an exact
+  `<namespace>.model-catalog.v1` marker — a value outside the family
+  refuses the configuration — for offline reads and refresh alike.
+  The refresh runs beside the loop, so its reply may land after later
+  requests' replies — correlate by `id`;
   the sidecar never polls on its own timer.
 - `chat.complete` / `chat.stream` — `params` is
   `{dialect, body, agent?}`: `dialect` is one of

@@ -85,12 +85,17 @@ impl CatalogSource {
 /// The synchronized catalog: a validated cache rooted at `dir`, fed by
 /// an optional configured source. The schema pin stands alone from the
 /// source — an offline-only store still applies the host's pin to every
-/// cache it reads.
+/// cache it reads and every document a refresh fetches.
 pub struct CatalogSync {
     dir: PathBuf,
     source: Option<CatalogSource>,
     schema: Option<String>,
     client: reqwest::Client,
+    /// One refresh at a time: the prior-cache read, the conditional
+    /// fetch and the commit run under this lock so a delayed older
+    /// response can never overwrite a newer revision another refresh
+    /// already committed.
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 impl CatalogSync {
@@ -101,6 +106,7 @@ impl CatalogSync {
             source: None,
             schema: None,
             client: crate::transport::upstream_client()?,
+            refresh_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -139,8 +145,8 @@ impl CatalogSync {
     }
 
     /// Pin the exact `<namespace>.model-catalog.v1` marker the host
-    /// expects when no source carries one — applied to offline reads
-    /// just as the source's own pin applies to refresh.
+    /// expects — the source's own pin wins when set; this one governs
+    /// every cache read and, for an unpinned source, refresh too.
     pub fn with_schema(mut self, schema: Option<String>) -> Self {
         self.schema = schema;
         self
@@ -196,17 +202,26 @@ impl CatalogSync {
             .source
             .as_ref()
             .ok_or_else(|| catalog_error("catalog_source_not_configured"))?;
+        // Serialized per store: each refresh re-reads the committed
+        // cache, revalidates from its revision and replaces the file
+        // before the next refresh reads — a delayed older fetch can
+        // never roll a newer commit back.
+        let _refresh = self.refresh_lock.lock().await;
         let path = self.cache_path();
+        // One effective pin governs the whole cycle: the prior cache
+        // decodes under it and the fetched document validates under it,
+        // exactly as `read` serves under it.
+        let pin = self.pin();
         // An invalid cached document is replaceable; an unsafe
         // filesystem read is not.
         let cache = read_cache_text(&path)?
             .as_deref()
-            .and_then(|text| decode_cache(text, source.schema()).ok())
+            .and_then(|text| decode_cache(text, pin).ok())
             .filter(|cache| cache.source == source.url.as_str());
         let revision = cache.as_ref().map(|cache| cache.catalog.revision.as_str());
         let updated = fetch(&source.url, revision).await.and_then(|catalog| {
             if let Some(catalog) = &catalog {
-                validate(catalog, source.schema())?;
+                validate(catalog, pin)?;
             }
             Ok(catalog)
         });
@@ -368,14 +383,13 @@ fn id_valid(value: &str) -> bool {
 }
 
 /// Structural validation of one fetched document against the family's
-/// published shape — the schema marker: the configured pin exactly, or
-/// any `<namespace>.model-catalog.v1` member — then the content rules.
-/// A document failing any rule is discarded, never cached.
+/// published shape — the schema marker: a `<namespace>.model-catalog.v1`
+/// member always, and exactly the configured pin when one is set —
+/// then the content rules. A document failing any rule is discarded,
+/// never cached.
 fn validate(catalog: &Catalog, schema: Option<&str>) -> Result<()> {
-    let schema_accepted = match schema {
-        Some(schema) => catalog.schema_version == schema,
-        None => catalog.schema_version.ends_with(SCHEMA_SUFFIX),
-    };
+    let schema_accepted = catalog.schema_version.ends_with(SCHEMA_SUFFIX)
+        && schema.is_none_or(|pin| catalog.schema_version == pin);
     if !(schema_accepted
         && catalog.revision.len() == 64
         && catalog
@@ -447,14 +461,19 @@ fn read_cache_text(path: &Path) -> Result<Option<String>> {
     }
 }
 
-/// The `schema` member's value — a nonblank pin string or none; a
-/// mistyped member is a source error whether a source exists or not.
+/// The `schema` member's value — a nonblank pin inside the
+/// `<namespace>.model-catalog.v1` family or none; a mistyped or
+/// off-family member is a source error whether a source exists or not.
 fn schema_pin(document: &Value) -> Result<Option<String>> {
     match document.get("schema") {
         None | Some(Value::Null) => Ok(None),
         Some(value) => value
             .as_str()
-            .filter(|schema| nonblank(schema))
+            .filter(|schema| {
+                nonblank(schema)
+                    && schema.len() > SCHEMA_SUFFIX.len()
+                    && schema.ends_with(SCHEMA_SUFFIX)
+            })
             .map(|schema| Some(schema.to_owned()))
             .ok_or_else(|| catalog_error(SOURCE_INVALID)),
     }
@@ -586,6 +605,14 @@ mod tests {
         serde_json::from_value(fixture(revision)).expect("fixture")
     }
 
+    /// The fixture under another family marker — a conforming document
+    /// from a different namespace.
+    fn catalog_as(revision: &str, schema: &str) -> Catalog {
+        let mut doc = fixture(revision);
+        doc["schemaVersion"] = schema.into();
+        serde_json::from_value(doc).expect("fixture")
+    }
+
     fn source(url: &str) -> CatalogSource {
         CatalogSource {
             url: https_url(url).expect("source url"),
@@ -711,6 +738,7 @@ mod tests {
             source: Some(source(url)),
             schema: None,
             client: fetch_client(),
+            refresh_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -834,6 +862,163 @@ mod tests {
             }}))
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn the_standalone_pin_governs_refresh_and_read() {
+        // An unpinned source with an SDK-set pin: the prior cache
+        // decodes and the fetched document validates under the same
+        // effective pin `read` serves — a different-namespace document
+        // is a stale keep, never a fresh write the next read rejects.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sync = store(dir.path(), "https://catalog.example/v1/catalog")
+            .with_schema(Some("acme.model-catalog.v1".to_owned()));
+        sync.refresh_with(async |_, _| Ok(Some(catalog_as(REVISION, "acme.model-catalog.v1"))))
+            .await
+            .expect("seed under the pin");
+
+        let stale = sync
+            .refresh_with(async |_, revision| {
+                assert_eq!(revision, Some(REVISION));
+                Ok(Some(catalog(OTHER_REVISION)))
+            })
+            .await
+            .expect("an off-pin document still answers stale");
+        assert_eq!(stale["status"], "stale");
+        assert_eq!(stale["catalog"]["revision"], REVISION);
+        assert_eq!(
+            sync.read().expect("read")["catalog"]["revision"],
+            REVISION,
+            "the pinned cache was never replaced"
+        );
+
+        // A cache written under another namespace is no revalidation
+        // base either: the pinned decode rejects it, the fetch goes
+        // out bare and the fresh write lands under the pin.
+        let foreign = CachedCatalog {
+            source: "https://catalog.example/v1/catalog".to_owned(),
+            catalog: catalog(OTHER_REVISION),
+        };
+        std::fs::write(
+            dir.path().join(CACHE_FILE),
+            serde_json::to_string(&foreign).expect("serialize"),
+        )
+        .expect("cache");
+        let fresh = sync
+            .refresh_with(async |_, revision| {
+                assert_eq!(revision, None, "an off-pin cache sends no ETag");
+                Ok(Some(catalog_as(OTHER_REVISION, "acme.model-catalog.v1")))
+            })
+            .await
+            .expect("refresh");
+        assert_eq!(fresh["status"], "fresh");
+        assert_eq!(
+            sync.read().expect("read")["catalog"]["revision"],
+            OTHER_REVISION
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_refreshes_commit_in_order() {
+        use std::sync::Arc;
+
+        // The read/fetch/commit cycle is serialized per store: the
+        // second refresh's fetch does not run until the first refresh
+        // committed, so a delayed older response never rolls the cache
+        // back.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sync = Arc::new(store(dir.path(), "https://catalog.example/v1/catalog"));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let committed = Arc::new(AtomicU64::new(0));
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let first = tokio::spawn({
+            let sync = Arc::clone(&sync);
+            let entered = Arc::clone(&entered);
+            let committed = Arc::clone(&committed);
+            async move {
+                let result = sync
+                    .refresh_with(async |_, _| {
+                        entered.notify_one();
+                        gate_rx.await.expect("gate");
+                        Ok(Some(catalog(REVISION)))
+                    })
+                    .await;
+                committed.store(1, Ordering::SeqCst);
+                result
+            }
+        });
+        let second = tokio::spawn({
+            let sync = Arc::clone(&sync);
+            async move {
+                entered.notified().await;
+                sync.refresh_with(async |_, _| {
+                    assert_eq!(
+                        committed.load(Ordering::SeqCst),
+                        1,
+                        "a second fetch waits for the first commit"
+                    );
+                    Ok(Some(catalog(OTHER_REVISION)))
+                })
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        gate_tx.send(()).expect("release the first fetch");
+        assert_eq!(
+            first.await.expect("first task").expect("refresh")["status"],
+            "fresh"
+        );
+        assert_eq!(
+            second.await.expect("second task").expect("refresh")["status"],
+            "fresh"
+        );
+        assert_eq!(
+            sync.read().expect("read")["catalog"]["revision"],
+            OTHER_REVISION,
+            "the last commit is the last refresh's document"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_schema_pin_must_be_a_family_member() {
+        // The documented pin is an exact `<namespace>.model-catalog.v1`
+        // marker — a pin naming another family refuses at configuration
+        // instead of letting an off-family cache through on a match.
+        for bad in [
+            "unrelated.schema.v9",
+            "vendor.model-catalog.v2",
+            ".model-catalog.v1",
+        ] {
+            assert!(
+                CatalogSource::from_document(&json!({
+                    "source": "https://catalog.example/v1/catalog",
+                    "schema": bad,
+                }))
+                .is_err(),
+                "{bad}"
+            );
+            assert!(
+                CatalogSync::from_config(&json!({"catalog": {
+                    "cacheDir": "unused",
+                    "schema": bad,
+                }}))
+                .is_err(),
+                "{bad}"
+            );
+        }
+        assert!(
+            CatalogSource::from_document(&json!({
+                "source": "https://catalog.example/v1/catalog",
+                "schema": "acme.model-catalog.v1",
+            }))
+            .expect("a family pin")
+            .is_some()
+        );
+
+        // And a directly-set off-family pin can never accept a
+        // document: the family check stands beside the exact match.
+        let doc = catalog_as(REVISION, "unrelated.schema.v9");
+        assert!(validate(&doc, Some("unrelated.schema.v9")).is_err());
     }
 
     #[tokio::test]

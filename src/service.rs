@@ -178,7 +178,9 @@ pub struct Service {
     /// In-flight request claims, for `chat.cancel`.
     inflight: Arc<InFlight>,
     /// Spawned chat and catalog tasks, reaped like the settlement set.
-    forward: Mutex<JoinSet<()>>,
+    /// Each task yields its reply's write result so a reply that never
+    /// reached the wire fails the serve instead of passing silently.
+    forward: Mutex<JoinSet<std::io::Result<()>>>,
     /// The configured catalog sync, when the host declared one —
     /// `catalog.read`/`catalog.refresh` answer from it.
     catalog_sync: Option<Arc<crate::catalog::CatalogSync>>,
@@ -243,10 +245,15 @@ impl Service {
     }
 
     /// Reap forward tasks that already finished — the same bound
-    /// `reap_settlements` keeps on the settlement set.
-    fn reap_forward(&self) {
+    /// `reap_settlements` keeps on the settlement set. A finished task's
+    /// reply write result surfaces here: a reply that never reached the
+    /// wire fails the serve instead of being counted as delivered.
+    fn reap_forward(&self) -> std::io::Result<()> {
         let mut tasks = lock(&self.forward);
-        while tasks.try_join_next().is_some() {}
+        while let Some(result) = tasks.try_join_next() {
+            forward_result(result)?;
+        }
+        Ok(())
     }
 
     /// Parse `{dialect, body, agent?}` into the canonical request, resolve
@@ -416,7 +423,7 @@ impl Service {
                         write_line(&writer, &error_reply(id, "request id in-flight")).await?;
                         continue;
                     };
-                    self.reap_forward();
+                    self.reap_forward()?;
                     let meter = Arc::clone(&self.meter);
                     let settle = Arc::clone(&self.settle);
                     let deadline = self.upstream_deadline;
@@ -426,20 +433,12 @@ impl Service {
                         tasks.spawn(async move {
                             let result = buffered_result(&meter, &settle, deadline, prepared).await;
                             drop(claim);
-                            let _ = write_line(&task_writer, &reply(id, result)).await;
+                            write_line(&task_writer, &reply(id, result)).await
                         });
                     } else {
                         tasks.spawn(async move {
-                            run_stream(
-                                &task_writer,
-                                &meter,
-                                &settle,
-                                deadline,
-                                id,
-                                prepared,
-                                claim,
-                            )
-                            .await;
+                            run_stream(&task_writer, &meter, &settle, deadline, id, prepared, claim)
+                                .await
                         });
                     }
                 }
@@ -449,12 +448,12 @@ impl Service {
                     // request or a chat cancel, and the refresh reply
                     // still lands on the wire — and drains on EOF.
                     Some(sync) => {
-                        self.reap_forward();
+                        self.reap_forward()?;
                         let sync = Arc::clone(sync);
                         let task_writer = Arc::clone(&writer);
                         lock(&self.forward).spawn(async move {
                             let result = sync.refresh().await;
-                            let _ = write_line(&task_writer, &reply(id, result)).await;
+                            write_line(&task_writer, &reply(id, result)).await
                         });
                     }
                     None => {
@@ -475,10 +474,16 @@ impl Service {
             }
         }
         // In-flight work runs to completion — its replies still belong on
-        // the wire.
+        // the wire. A reply that never landed is a serve failure, not a
+        // clean drain.
         let mut drained = std::mem::take(&mut *lock(&self.forward));
-        while drained.join_next().await.is_some() {}
-        Ok(())
+        let mut failure = None;
+        while let Some(result) = drained.join_next().await {
+            if let Err(error) = forward_result(result) {
+                failure = failure.or(Some(error));
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     /// Drain pending settlement tasks and persist the counters. The
@@ -596,6 +601,18 @@ async fn write_line(writer: &SharedWriter, value: &Value) -> std::io::Result<()>
     guard.flush().await
 }
 
+/// One finished forward task as the serve loop's I/O result: the task's
+/// own write result propagates, and a join failure is an I/O error too —
+/// a panicked task never delivered its reply either.
+fn forward_result(
+    result: std::result::Result<std::io::Result<()>, tokio::task::JoinError>,
+) -> std::io::Result<()> {
+    match result {
+        Ok(result) => result,
+        Err(join) => Err(std::io::Error::other(join)),
+    }
+}
+
 /// A reply carrying a result or the error text — the aor.rs convention:
 /// errors are strings, never exception payloads.
 fn reply(id: Value, result: Result<Value>) -> Value {
@@ -687,7 +704,8 @@ enum PumpOutcome {
     Done,
     Ended(a4mp::Error),
     Deadline,
-    WriteFailed,
+    /// The wire stopped accepting frames — the serve loop's failure.
+    WriteFailed(std::io::Error),
 }
 
 /// What the pump accumulated while it ran. Lives outside the deadline
@@ -756,8 +774,8 @@ async fn pump_frames(
     let mut encoder = a4mp::wire::stream_encoder(dialect, &client_model);
     for frame in encoder.preamble() {
         state.wrote_frame = true;
-        if write_line(writer, &frame_line(id, &frame)).await.is_err() {
-            return PumpOutcome::WriteFailed;
+        if let Err(error) = write_line(writer, &frame_line(id, &frame)).await {
+            return PumpOutcome::WriteFailed(error);
         }
     }
     loop {
@@ -769,8 +787,8 @@ async fn pump_frames(
                 }
                 for frame in encoder.encode(&event) {
                     state.wrote_frame = true;
-                    if write_line(writer, &frame_line(id, &frame)).await.is_err() {
-                        return PumpOutcome::WriteFailed;
+                    if let Err(error) = write_line(writer, &frame_line(id, &frame)).await {
+                        return PumpOutcome::WriteFailed(error);
                     }
                 }
                 state.losses.extend(encoder.drain_losses());
@@ -781,8 +799,8 @@ async fn pump_frames(
     }
     for frame in encoder.finish() {
         state.wrote_frame = true;
-        if write_line(writer, &frame_line(id, &frame)).await.is_err() {
-            return PumpOutcome::WriteFailed;
+        if let Err(error) = write_line(writer, &frame_line(id, &frame)).await {
+            return PumpOutcome::WriteFailed(error);
         }
     }
     state.losses.extend(encoder.drain_losses());
@@ -793,7 +811,8 @@ async fn pump_frames(
 /// `stream:"end"` line — or the ordinary error reply when nothing ever
 /// framed. The last usage event settles once, on success, failure or
 /// cancel alike, and the request's claim is released before the
-/// terminal line is written.
+/// terminal line is written. A frame or terminal line the wire refused
+/// comes back as the task's I/O result.
 async fn run_stream(
     writer: &SharedWriter,
     meter: &Arc<Meter>,
@@ -802,7 +821,7 @@ async fn run_stream(
     id: Value,
     mut prepared: PreparedChat,
     claim: Claim,
-) {
+) -> std::io::Result<()> {
     let provider = prepared.bound.provider.as_str().to_owned();
     let mut state = PumpState {
         wrote_frame: false,
@@ -818,14 +837,14 @@ async fn run_stream(
     };
     spawn_settle(meter, settle, provider, state.last_usage);
     let line = match outcome {
-        PumpOutcome::Done => Some(end_line(&id, "done", &state.losses, None)),
+        PumpOutcome::Done => end_line(&id, "done", &state.losses, None),
         PumpOutcome::Deadline => {
             let error = Error::UpstreamDeadline(deadline.unwrap_or_default()).to_string();
-            Some(if state.wrote_frame {
+            if state.wrote_frame {
                 end_line(&id, "error", &state.losses, Some(&error))
             } else {
                 error_reply(id, &error)
-            })
+            }
         }
         PumpOutcome::Ended(error) => {
             // Adapter failures surface through the same `adapter:`
@@ -833,18 +852,19 @@ async fn run_stream(
             // the wire, whether the call framed or not.
             let status = matches!(error, a4mp::Error::Cancelled);
             let message = Error::Adapter(error).to_string();
-            Some(match (state.wrote_frame, status) {
+            match (state.wrote_frame, status) {
                 (true, true) => end_line(&id, "cancelled", &state.losses, Some(&message)),
                 (true, false) => end_line(&id, "error", &state.losses, Some(&message)),
                 (false, _) => error_reply(id, &message),
-            })
+            }
         }
-        PumpOutcome::WriteFailed => None,
+        PumpOutcome::WriteFailed(error) => {
+            drop(claim);
+            return Err(error);
+        }
     };
     drop(claim);
-    if let Some(line) = line {
-        let _ = write_line(writer, &line).await;
-    }
+    write_line(writer, &line).await
 }
 
 #[cfg(test)]

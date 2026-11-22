@@ -157,8 +157,9 @@ The routes document is one object:
   credentials, query or fragment and its absence leaves the store
   offline-only; `schema` optionally pins the exact
   `<namespace>.model-catalog.v1` marker the host expects (unconfigured,
-  any family member passes) — the pin constrains offline reads the same
-  as refreshed ones. `catalog.read` answers the local cache —
+  any family member passes; a value outside the family refuses the
+  configuration) — the pin constrains offline reads the same as
+  refreshed ones. `catalog.read` answers the local cache —
   never a fetch; `catalog.refresh` runs one conditional GET per
   request — `If-None-Match` when a revision is cached, `304` answers
   `unchanged` with no write, a valid `200` replaces the cache
