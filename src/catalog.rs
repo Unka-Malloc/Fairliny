@@ -382,13 +382,21 @@ fn id_valid(value: &str) -> bool {
     })
 }
 
+/// Family membership: a non-empty namespace before the marker — the
+/// one rule configured pins, fetched documents and cached documents
+/// share. `.model-catalog.v1` alone names no namespace and is outside
+/// the family.
+fn in_schema_family(schema: &str) -> bool {
+    schema.len() > SCHEMA_SUFFIX.len() && schema.ends_with(SCHEMA_SUFFIX)
+}
+
 /// Structural validation of one fetched document against the family's
 /// published shape — the schema marker: a `<namespace>.model-catalog.v1`
 /// member always, and exactly the configured pin when one is set —
 /// then the content rules. A document failing any rule is discarded,
 /// never cached.
 fn validate(catalog: &Catalog, schema: Option<&str>) -> Result<()> {
-    let schema_accepted = catalog.schema_version.ends_with(SCHEMA_SUFFIX)
+    let schema_accepted = in_schema_family(&catalog.schema_version)
         && schema.is_none_or(|pin| catalog.schema_version == pin);
     if !(schema_accepted
         && catalog.revision.len() == 64
@@ -469,11 +477,7 @@ fn schema_pin(document: &Value) -> Result<Option<String>> {
         None | Some(Value::Null) => Ok(None),
         Some(value) => value
             .as_str()
-            .filter(|schema| {
-                nonblank(schema)
-                    && schema.len() > SCHEMA_SUFFIX.len()
-                    && schema.ends_with(SCHEMA_SUFFIX)
-            })
+            .filter(|schema| nonblank(schema) && in_schema_family(schema))
             .map(|schema| Some(schema.to_owned()))
             .ok_or_else(|| catalog_error(SOURCE_INVALID)),
     }
@@ -1019,6 +1023,40 @@ mod tests {
         // document: the family check stands beside the exact match.
         let doc = catalog_as(REVISION, "unrelated.schema.v9");
         assert!(validate(&doc, Some("unrelated.schema.v9")).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_empty_namespace_is_outside_the_family() {
+        // The family is `<namespace>.model-catalog.v1` — the bare
+        // suffix names no namespace, and document validation applies
+        // the same rule the pin parser does.
+        let bare = catalog_as(REVISION, ".model-catalog.v1");
+        assert!(validate(&bare, None).is_err());
+        assert!(validate(&bare, Some("vendor.model-catalog.v1")).is_err());
+
+        // A fetched bare-suffix document never caches: the refused
+        // refresh leaves the empty store empty.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sync = store(dir.path(), "https://catalog.example/v1/catalog");
+        assert!(
+            sync.refresh_with(async |_, _| Ok(Some(catalog_as(REVISION, ".model-catalog.v1"))))
+                .await
+                .is_err()
+        );
+        assert_eq!(sync.read().expect("read")["status"], "empty");
+
+        // And one planted in the cache never serves: the cached path
+        // validates the same way.
+        let foreign = CachedCatalog {
+            source: "https://catalog.example/v1/catalog".to_owned(),
+            catalog: catalog_as(REVISION, ".model-catalog.v1"),
+        };
+        std::fs::write(
+            dir.path().join(CACHE_FILE),
+            serde_json::to_string(&foreign).expect("serialize"),
+        )
+        .expect("cache");
+        assert!(sync.read().is_err());
     }
 
     #[tokio::test]
