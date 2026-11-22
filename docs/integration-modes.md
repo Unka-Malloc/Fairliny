@@ -10,7 +10,7 @@ one JSON object per line over stdio — both paths land on the same
 
 ```toml
 [dependencies]
-fairliny-gateway = "0.1"
+fairliny-gateway = "0.2"
 ```
 
 ```rust
@@ -27,10 +27,13 @@ use fairliny_gateway::{
 // epoch file the custody owner rotates.
 let leases = Arc::new(Leases::disconnected());
 let document = Leases::read_handoff(handoff_channel)?;
+leases.authorize_scope("openai-key", ["<credentialId>"])?;
 leases.install_handoff(&document, Arc::new(FileEpochSource::new(epoch_file)))?;
 
-let mut router = Router::new(transport, leases); // Leases is the a4mp CredentialResolver
-router.add_route("chat", route)?;
+// with_leases wires the port as the resolver and registers each scoped
+// route's surface so the declared scope is enforced at resolution.
+let mut router = Router::with_leases(transport, leases);
+router.add_route_scoped("chat", route, "openai-key")?; // api-key/bearer must scope
 let meter = Meter::open(state_root)?;            // or compose(root, binding) / unmetered()
 let service = Service::new(router, meter);
 ```
@@ -40,6 +43,28 @@ a4mp adapters, `leases` is the credential custody port, `meter` carries
 the admission counters and response settlement, `export` renders the
 Prometheus/OpenMetrics text a host mounts at its own `/metrics` route.
 `Service::new` is only the assembly of those three.
+
+### Migrating to 0.2 — credential scopes are required
+
+From the 0.2 release boundary, an `api-key`/`bearer` route must declare
+a credential scope. A 0.1 routes document or SDK caller that forwards a
+leased mechanism without one now refuses at declaration:
+
+- Routes documents: add the `credentialScopes` table authorizing each
+  scope's `credentialId`s, and `credentialScope` on every
+  `api-key`/`bearer` entry — including entries that shared one key
+  before, which is exactly the sharing the boundary removes.
+- SDK callers: build the router with `Router::with_leases` (or
+  `with_catalog_leases`) and declare scoped routes through
+  `add_route_scoped`/`add_endpoint_route_scoped` or the document's
+  `credentialScope`. A scoped declaration on `Router::new`/
+  `with_catalog` refuses — a host-supplied resolver cannot enforce the
+  scope it would project. `add_route`/`add_endpoint_route` remain for
+  `none`-auth routes.
+- Hosts driving the lease lifecycle themselves use `Leases::over_lease`
+  and `Leases::install_lease`/`clear`, replacing the 0.1
+  `over_slot`/`slot` surface — clear and replace now cover every scoped
+  slot, not only the unscoped one.
 
 ## Sidecar — `fairliny serve`
 

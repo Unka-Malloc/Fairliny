@@ -13,8 +13,9 @@ Embed `fairliny-gateway` and compose the outward model-service face in-process.
   in its own process — `Service::dispatch` per request, or the modules
   directly.
 - The host owns custody and feeds `CredentialHandoff` documents in, or
-  drives the lease lifecycle itself through `Leases::over_slot` and
-  `Leases::slot`.
+  drives the lease lifecycle itself through `Leases::over_lease`,
+  `Leases::install_lease` and `Leases::clear` — each applies to the
+  whole lease state, scoped slots included.
 
 ## Canonical calls
 
@@ -24,7 +25,7 @@ let document = Leases::read_handoff(channel)?;          // bounded, zeroizing bu
 leases.authorize_scope("openai-key", ["<credentialId>"])?;  // host-authorized scopes
 leases.install_handoff(&document, epoch_source)?;       // FileEpochSource: custody-driven revocation
 let mut router = Router::with_leases(transport, leases);  // registers scoped surfaces
-router.add_route("chat", route)?;                       // Route: profile routes
+router.add_route("local", route)?;                      // Route: profile routes, `none` auth
 router.add_route_scoped("chat", route, "openai-key")?;    // api-key/bearer requires a scope
 router.add_endpoint_route("vendor", endpoint_route)?;   // EndpointRoute: explicit baseUrl
 // or register_adapter / with_catalog_leases

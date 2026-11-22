@@ -251,6 +251,24 @@ fn parse_vars(vars: Option<&Value>) -> Result<BTreeMap<String, String>> {
         .collect()
 }
 
+/// A parsed route declaration awaiting its checks — the staging shape
+/// `load_routes` validates before anything commits and `add_*` commits
+/// once its checks pass.
+enum Declaration {
+    Profile(Route),
+    Endpoint(EndpointRoute),
+}
+
+/// The credential-scope registration one declared route produced: the
+/// scope name plus the surface it was bound against — kept so a
+/// replacement drops the obsolete binding while a surface shared with
+/// another route keeps the binding that route still needs.
+#[derive(Clone)]
+struct ScopedBinding {
+    scope: String,
+    target: ServiceTarget,
+}
+
 /// A resolved route: the bound adapter and what the upstream call is for.
 pub struct BoundRoute {
     /// The live adapter a4mp bound for this target.
@@ -274,8 +292,9 @@ pub struct Router {
     /// Vendors the catalog does not carry, bound by explicit endpoint.
     endpoint_routes: BTreeMap<String, EndpointRoute>,
     /// The credential scope each declared route named — a
-    /// host-authorized entry in the lease port's scope table.
-    scopes: BTreeMap<String, String>,
+    /// host-authorized entry in the lease port's scope table — plus the
+    /// surface it was registered against.
+    scopes: BTreeMap<String, ScopedBinding>,
     /// Adapters the host bound itself — custom surfaces and test stubs.
     /// They skip profile checks because the host already owns the binding.
     prebound: BTreeMap<String, (Arc<dyn Adapter>, String)>,
@@ -390,19 +409,54 @@ impl Router {
     }
 
     /// The shared declaration path for profile routes: scope contract,
-    /// catalog checks, one declaration bind, then the scope registration
-    /// and the table insert.
+    /// catalog checks, one declaration bind, then the commit.
     fn add_profile(&mut self, model: String, route: Route, scope: Option<String>) -> Result<()> {
+        if self.endpoint_routes.contains_key(&model) {
+            return Err(Error::Route {
+                model,
+                reason: "model is already bound to an endpoint route".to_owned(),
+            });
+        }
+        let target = self.check_profile(&model, &route, &scope)?;
+        self.commit(model, Declaration::Profile(route), target, scope)
+    }
+
+    /// The endpoint counterpart of [`Self::add_profile`].
+    fn add_endpoint(
+        &mut self,
+        model: String,
+        route: EndpointRoute,
+        scope: Option<String>,
+    ) -> Result<()> {
+        if self.routes.contains_key(&model) {
+            return Err(Error::Route {
+                model,
+                reason: "model is already bound to a profile route".to_owned(),
+            });
+        }
+        let target = self.check_endpoint(&model, &route, &scope)?;
+        self.commit(model, Declaration::Endpoint(route), target, scope)
+    }
+
+    /// Every fallible check a profile-route declaration runs — the
+    /// credential-scope contract, the catalog lookup, the mechanism the
+    /// profile must accept, and one declaration bind that refuses a
+    /// missing or misspelled endpoint variable, an unbound protocol or a
+    /// cleartext credential path — producing the surface the route binds
+    /// to. Nothing commits here; `load_routes` runs the same checks
+    /// against its staged table so a bad entry anywhere refuses the
+    /// whole document.
+    fn check_profile(
+        &self,
+        model: &str,
+        route: &Route,
+        scope: &Option<String>,
+    ) -> Result<ServiceTarget> {
         let refuse = |reason: String| Error::Route {
-            model: model.clone(),
+            model: model.to_owned(),
             reason,
         };
-        check_credential_scope(&route.auth, &scope).map_err(refuse)?;
-        if self.endpoint_routes.contains_key(&model) {
-            return Err(refuse(
-                "model is already bound to an endpoint route".to_owned(),
-            ));
-        }
+        check_credential_scope(&route.auth, scope).map_err(refuse)?;
         let profile = self
             .client
             .catalog()
@@ -415,29 +469,23 @@ impl Router {
                 auth_label(&route.auth)
             )));
         }
-        // Declaration binds once and drops the adapter — resolve binds
-        // its own per call. Running the bind here is what refuses a
-        // missing or misspelled endpoint variable, an unbound protocol or
-        // a cleartext credential path at startup.
-        let adapter = self.bind_profile(&route).map_err(refuse)?;
-        self.register_scope(&model, adapter.target(), scope)
-            .map_err(refuse)?;
-        self.routes.insert(model, route);
-        Ok(())
+        let adapter = self.bind_profile(route).map_err(refuse)?;
+        self.check_scope_resolver(scope).map_err(refuse)?;
+        Ok(adapter.target().clone())
     }
 
-    /// The endpoint counterpart of [`Self::add_profile`].
-    fn add_endpoint(
-        &mut self,
-        model: String,
-        route: EndpointRoute,
-        scope: Option<String>,
-    ) -> Result<()> {
+    /// The endpoint counterpart of [`Self::check_profile`].
+    fn check_endpoint(
+        &self,
+        model: &str,
+        route: &EndpointRoute,
+        scope: &Option<String>,
+    ) -> Result<ServiceTarget> {
         let refuse = |reason: String| Error::Route {
-            model: model.clone(),
+            model: model.to_owned(),
             reason,
         };
-        check_credential_scope(&route.auth, &scope).map_err(refuse)?;
+        check_credential_scope(&route.auth, scope).map_err(refuse)?;
         if !matches!(route.auth, AuthKind::None)
             && ProviderCredential::for_auth(&route.auth).is_none()
         {
@@ -448,59 +496,115 @@ impl Router {
                 auth_label(&route.auth)
             )));
         }
-        if self.routes.contains_key(&model) {
-            return Err(refuse(
-                "model is already bound to a profile route".to_owned(),
-            ));
-        }
         check_base_url(&route.base_url).map_err(refuse)?;
         if let Some(header) = &route.auth_header {
             check_auth_header(&route.protocol, &route.auth, header).map_err(refuse)?;
         }
-        let adapter = self.bind_endpoint(&route).map_err(refuse)?;
-        self.register_scope(&model, adapter.target(), scope)
-            .map_err(refuse)?;
-        self.endpoint_routes.insert(model, route);
-        Ok(())
+        let adapter = self.bind_endpoint(route).map_err(refuse)?;
+        self.check_scope_resolver(scope).map_err(refuse)?;
+        Ok(adapter.target().clone())
     }
 
-    /// Register a declared credential scope against the surface the
-    /// declaration bind produced, and record it for projections. No-op
-    /// for unscoped routes and for routers whose resolver is not the
-    /// crate's lease port — a host-supplied resolver owns its own
-    /// credential dispatch.
-    fn register_scope(
-        &mut self,
-        model: &str,
-        target: &ServiceTarget,
-        scope: Option<String>,
-    ) -> std::result::Result<(), String> {
+    /// The resolver check a scoped declaration needs: a credential scope
+    /// is only as real as the port enforcing it, so a scope may only be
+    /// declared when the router's resolver is the crate's lease port —
+    /// `Router::with_leases` — and the scope is one the host authorized.
+    /// A host-supplied resolver owns its credential dispatch and cannot
+    /// honor the declaration; accepting it would project a scope in
+    /// `models.list` that resolution silently ignores.
+    fn check_scope_resolver(&self, scope: &Option<String>) -> std::result::Result<(), String> {
         let Some(scope) = scope else {
             return Ok(());
         };
-        if let Some(leases) = &self.leases {
-            leases
-                .register_target_scope(target, &scope)
-                .map_err(|error| error.to_string())?;
+        let Some(leases) = &self.leases else {
+            return Err("credential scope requires the lease port: declare through \
+                 Router::with_leases so the declared scope is enforced at \
+                 resolution"
+                .to_owned());
+        };
+        if !leases.scope_authorized(scope) {
+            return Err("credential_scope_unauthorized".to_owned());
         }
-        self.scopes.insert(model.to_owned(), scope);
         Ok(())
+    }
+
+    /// Commit one fully checked declaration: republish the whole scope
+    /// table — the lease port swaps bindings atomically, so the route's
+    /// new binding lands and the one a replaced route leaves dies in the
+    /// same publish — then land the route itself. A refused publish
+    /// leaves every table untouched.
+    fn commit(
+        &mut self,
+        model: String,
+        declaration: Declaration,
+        target: ServiceTarget,
+        scope: Option<String>,
+    ) -> Result<()> {
+        let mut scopes = self.scopes.clone();
+        match scope {
+            Some(scope) => {
+                scopes.insert(model.clone(), ScopedBinding { scope, target });
+            }
+            None => {
+                scopes.remove(&model);
+            }
+        }
+        self.publish_scopes(&scopes)
+            .map_err(|reason| Error::Route {
+                model: model.clone(),
+                reason,
+            })?;
+        self.scopes = scopes;
+        match declaration {
+            Declaration::Profile(route) => {
+                self.routes.insert(model, route);
+            }
+            Declaration::Endpoint(route) => {
+                self.endpoint_routes.insert(model, route);
+            }
+        }
+        Ok(())
+    }
+
+    /// Republish every live scope binding to the lease port in one swap.
+    /// The declared set is the whole table, so a route that stopped
+    /// declaring a scope releases its old binding, a route rebound to
+    /// another surface frees the original target, and a surface two
+    /// routes share keeps the binding both still need.
+    fn publish_scopes(
+        &self,
+        scopes: &BTreeMap<String, ScopedBinding>,
+    ) -> std::result::Result<(), String> {
+        let Some(leases) = &self.leases else {
+            return Ok(());
+        };
+        leases
+            .replace_target_scopes(
+                scopes
+                    .values()
+                    .map(|binding| (&binding.target, binding.scope.as_str())),
+            )
+            .map_err(|error| error.to_string())
     }
 
     /// Load a routes document `{"routes":[{model,provider|endpoint,...,
     /// credentialScope?}]}` — plus the `credentialScopes` authorization
-    /// table the scopes name, which the lease port reads. A malformed
-    /// entry refuses the whole table — the gateway never silently runs
-    /// half a route table.
+    /// table the scopes name, which the lease port reads. A `routes`
+    /// member must be an array when present, and the whole document is
+    /// parsed and checked before anything commits: a malformed entry
+    /// refuses the table — the gateway never silently runs half of it.
     pub fn load_routes(&mut self, document: &Value) -> Result<()> {
-        let empty = Vec::new();
-        let routes = document
-            .get("routes")
-            .and_then(Value::as_array)
-            .unwrap_or(&empty);
-        for entry in routes {
+        let entries = match document.get("routes") {
+            None => return Ok(()),
+            Some(routes) => routes.as_array().ok_or_else(|| invalid("routes"))?,
+        };
+        // Parse every entry first — a malformed one refuses the document
+        // before any route or scope registration commits.
+        let mut staged = Vec::with_capacity(entries.len());
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in entries {
             let credential_scope = entry_credential_scope(entry)?;
-            match (
+            let (model, declaration) = match (
                 entry.get("provider").is_some(),
                 entry.get("endpoint").is_some(),
             ) {
@@ -516,20 +620,70 @@ impl Router {
                 }
                 (true, false) => {
                     let (model, route) = Route::from_document(entry)?;
-                    match credential_scope {
-                        Some(scope) => self.add_route_scoped(model, route, scope)?,
-                        None => self.add_route(model, route)?,
-                    }
+                    (model, Declaration::Profile(route))
                 }
                 (false, true) => {
                     let (model, route) = EndpointRoute::from_document(entry)?;
-                    match credential_scope {
-                        Some(scope) => self.add_endpoint_route_scoped(model, route, scope)?,
-                        None => self.add_endpoint_route(model, route)?,
-                    }
+                    (model, Declaration::Endpoint(route))
+                }
+            };
+            if !seen.insert(model.clone()) {
+                return Err(Error::Request(format!(
+                    "routes document declares {model:?} twice"
+                )));
+            }
+            staged.push((model, declaration, credential_scope));
+        }
+        // Build the would-be tables and run every declaration check
+        // against them, so a bad entry anywhere leaves the live table
+        // untouched.
+        let mut routes = self.routes.clone();
+        let mut endpoint_routes = self.endpoint_routes.clone();
+        let mut scopes = self.scopes.clone();
+        for (model, declaration, scope) in staged {
+            let collision = match declaration {
+                Declaration::Profile(_) if endpoint_routes.contains_key(&model) => {
+                    Some("model is already bound to an endpoint route")
+                }
+                Declaration::Endpoint(_) if routes.contains_key(&model) => {
+                    Some("model is already bound to a profile route")
+                }
+                _ => None,
+            };
+            if let Some(reason) = collision {
+                return Err(Error::Route {
+                    model,
+                    reason: reason.to_owned(),
+                });
+            }
+            let target = match &declaration {
+                Declaration::Profile(route) => self.check_profile(&model, route, &scope)?,
+                Declaration::Endpoint(route) => self.check_endpoint(&model, route, &scope)?,
+            };
+            match scope {
+                Some(scope) => {
+                    scopes.insert(model.clone(), ScopedBinding { scope, target });
+                }
+                None => {
+                    scopes.remove(&model);
+                }
+            }
+            match declaration {
+                Declaration::Profile(route) => {
+                    routes.insert(model, route);
+                }
+                Declaration::Endpoint(route) => {
+                    endpoint_routes.insert(model, route);
                 }
             }
         }
+        // One consistent landing: the scope publish — the only step that
+        // can still refuse, on a surface conflict between entries — then
+        // the route tables swap in together.
+        self.publish_scopes(&scopes).map_err(Error::Request)?;
+        self.routes = routes;
+        self.endpoint_routes = endpoint_routes;
+        self.scopes = scopes;
         Ok(())
     }
 
@@ -557,7 +711,7 @@ impl Router {
 
     /// The credential scope a declared route named, for projections.
     pub fn credential_scope(&self, model: &str) -> Option<&str> {
-        self.scopes.get(model).map(String::as_str)
+        self.scopes.get(model).map(|binding| binding.scope.as_str())
     }
 
     /// The host-bound adapters, for read-only projections.
@@ -1015,12 +1169,15 @@ mod tests {
     }
 
     /// A router over the built-in catalog whose transport is never
-    /// invoked — declaration binds adapters but sends nothing.
+    /// invoked — declaration binds adapters but sends nothing — and
+    /// whose lease port authorizes `vendor-scope`, the resolver shape
+    /// every scoped declaration requires.
     fn declaring_router() -> Router {
-        Router::new(
-            Arc::new(a4mp::ReqwestTransport::new()),
-            Arc::new(a4mp::NoCredentials),
-        )
+        let leases = Arc::new(Leases::disconnected());
+        leases
+            .authorize_scope("vendor-scope", [uuid::Uuid::new_v4().to_string()])
+            .expect("authorize");
+        Router::with_leases(Arc::new(a4mp::ReqwestTransport::new()), leases)
     }
 
     fn declare(entry: Value) -> Result<()> {

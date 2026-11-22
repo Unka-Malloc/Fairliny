@@ -391,7 +391,22 @@ mod tests {
         leases
             .install_handoff_self_epoch(&document)
             .expect("install");
-        assert!(leases.slot().resolve(ProviderCredential::ApiKey).is_ok());
+        let target = a4mp::ServiceTarget::new(
+            "stub",
+            a4mp::Protocol::Other("stub".to_owned()),
+            url::Url::parse("https://stub.invalid/").expect("url"),
+        );
+        let resolved = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(a4mp::CredentialResolver::resolve(
+                &leases,
+                a4mp::CredentialScope {
+                    target: &target,
+                    auth: &a4mp::AuthKind::ApiKey,
+                },
+            ));
+        assert!(resolved.is_ok());
     }
 }
 
