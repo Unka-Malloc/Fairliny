@@ -4,7 +4,7 @@
 //! real provider.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use credential_lease::{CredentialHandoff, LeaseEpochSource, LeasedCredential, SecretBytes};
@@ -133,7 +133,37 @@ fn handoff_document_for(
 /// the `ProviderCredential` family, minted under `epoch`.
 fn handoff_bytes(epoch: &str) -> Vec<u8> {
     let id = uuid::Uuid::new_v4().to_string();
-    handoff_document(epoch, &[(&id, b"test-credential-material")])
+    handoff_document(epoch, &[(&id, secret_a().as_bytes())])
+}
+
+/// Scope names for lease fixtures — one generated identifier per name
+/// for the whole test binary so fixtures never carry a static scope
+/// string that reads as checked-in material.
+fn vendor_scope() -> &'static str {
+    static SCOPE: OnceLock<String> = OnceLock::new();
+    SCOPE.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
+fn scope_a() -> &'static str {
+    static SCOPE: OnceLock<String> = OnceLock::new();
+    SCOPE.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
+fn scope_b() -> &'static str {
+    static SCOPE: OnceLock<String> = OnceLock::new();
+    SCOPE.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
+/// Secret material for handoff fixtures — generated once per name so
+/// no credential-shaped literal ever sits in the tree.
+fn secret_a() -> &'static str {
+    static SECRET: OnceLock<String> = OnceLock::new();
+    SECRET.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
+fn secret_b() -> &'static str {
+    static SECRET: OnceLock<String> = OnceLock::new();
+    SECRET.get_or_init(|| uuid::Uuid::new_v4().to_string())
 }
 
 /// The target every test adapter claims — a prebound stub surface.
@@ -990,7 +1020,7 @@ fn a_route_naming_an_unknown_provider_fails_closed() {
         vars: Default::default(),
     };
     let error = router
-        .add_route_scoped("model", route, "vendor-scope")
+        .add_route_scoped("model", route, vendor_scope())
         .expect_err("closed");
     assert!(error.to_string().contains("unknown provider"));
     assert!(router.resolve("model").is_err());
@@ -1609,8 +1639,8 @@ async fn serve_endpoint_route(
     route["endpoint"]["baseUrl"] = format!("http://{addr}{base_path}").into();
     let credential_id = uuid::Uuid::new_v4().to_string();
     let leases = if matches!(route["auth"].as_str(), Some("api-key" | "bearer")) {
-        route["credentialScope"] = "vendor-scope".into();
-        scoped_leases(&[(&credential_id, b"test-credential-material", "vendor-scope")])
+        route["credentialScope"] = vendor_scope().into();
+        scoped_leases(&[(&credential_id, secret_a().as_bytes(), vendor_scope())])
     } else {
         Arc::new(Leases::disconnected())
     };
@@ -1650,7 +1680,7 @@ async fn an_endpoint_route_forwards_to_an_uncatalogued_vendor() {
     assert_eq!(received.body["model"], "vendor-model-1");
     assert_eq!(
         received.header("authorization"),
-        Some("Bearer test-credential-material")
+        Some(format!("Bearer {}", secret_a()).as_str())
     );
 
     let listed = reply_for(&replies, 1);
@@ -1668,10 +1698,7 @@ async fn an_endpoint_route_forwards_to_an_uncatalogued_vendor() {
     assert!(entry.get("provider").is_none(), "{entry}");
     // No projection or reply ever carries the secret.
     for reply in &replies {
-        assert!(
-            !reply.to_string().contains("test-credential-material"),
-            "{reply}"
-        );
+        assert!(!reply.to_string().contains(secret_a()), "{reply}");
     }
 
     let answer = reply_for(&replies, 2);
@@ -1709,10 +1736,7 @@ async fn an_endpoint_route_speaks_the_declared_protocol_family() {
     // adapter speaks Messages and carries the key as `x-api-key`.
     assert_eq!(received.request_line, "POST /v1/messages HTTP/1.1");
     assert_eq!(received.body["model"], "vendor-messages-1");
-    assert_eq!(
-        received.header("x-api-key"),
-        Some("test-credential-material")
-    );
+    assert_eq!(received.header("x-api-key"), Some(secret_a()));
     assert_eq!(received.header("authorization"), None);
     let answer = reply_for(&replies, 2);
     assert_eq!(
@@ -1784,8 +1808,8 @@ async fn each_scoped_route_resolves_only_the_credentials_its_host_authorized() {
     let scope_a = uuid::Uuid::new_v4().to_string();
     let scope_b = uuid::Uuid::new_v4().to_string();
     let leases = scoped_leases(&[
-        (&id_a, b"key-for-vendor-a", &scope_a),
-        (&id_b, b"key-for-vendor-b", &scope_b),
+        (&id_a, secret_a().as_bytes(), &scope_a),
+        (&id_b, secret_b().as_bytes(), &scope_b),
     ]);
     let mut router = Router::with_leases(loopback_transport(), leases);
     router
@@ -1811,8 +1835,10 @@ async fn each_scoped_route_resolves_only_the_credentials_its_host_authorized() {
     assert!(reply_for(&replies, 2).get("error").is_none());
     let a = upstream_a.join().expect("upstream a");
     let b = upstream_b.join().expect("upstream b");
-    assert_eq!(a.header("authorization"), Some("Bearer key-for-vendor-a"));
-    assert_eq!(b.header("authorization"), Some("Bearer key-for-vendor-b"));
+    let bearer_a = format!("Bearer {}", secret_a());
+    let bearer_b = format!("Bearer {}", secret_b());
+    assert_eq!(a.header("authorization"), Some(bearer_a.as_str()));
+    assert_eq!(b.header("authorization"), Some(bearer_b.as_str()));
 }
 
 #[tokio::test]
@@ -1835,7 +1861,7 @@ async fn a_scope_whose_credential_the_handoff_lacks_fails_closed() {
         .expect("authorize");
     leases
         .install_handoff(
-            &handoff_document(&epoch_id, &[(&real_id, b"the-other-key")]),
+            &handoff_document(&epoch_id, &[(&real_id, secret_a().as_bytes())]),
             epoch,
         )
         .expect("install");
@@ -1870,8 +1896,8 @@ fn a_route_naming_a_scope_the_host_never_authorized_refuses_to_declare() {
     // pointing at nothing fails at startup, not at first forward.
     let leases = scoped_leases(&[(
         &uuid::Uuid::new_v4().to_string(),
-        b"test-credential-material",
-        "vendor-scope",
+        secret_a().as_bytes(),
+        vendor_scope(),
     )]);
     let mut router = Router::with_leases(loopback_transport(), leases);
     let error = router
@@ -1898,7 +1924,7 @@ fn a_scoped_route_is_refused_when_the_resolver_cannot_enforce_it() {
     let error = router
         .load_routes(&serde_json::json!({"routes": [{
             "model": "m", "endpoint": endpoint,
-            "auth": "api-key", "credentialScope": "vendor-scope"
+            "auth": "api-key", "credentialScope": vendor_scope()
         }]}))
         .expect_err("scope without the lease port");
     assert!(error.to_string().contains("lease port"), "{error}");
@@ -1916,7 +1942,7 @@ fn a_scoped_route_is_refused_when_the_resolver_cannot_enforce_it() {
         vars: Default::default(),
     };
     let error = router
-        .add_route_scoped("m", route, "vendor-scope")
+        .add_route_scoped("m", route, vendor_scope())
         .expect_err("scoped profile route without the lease port");
     assert!(error.to_string().contains("lease port"), "{error}");
     assert!(router.resolve("m").is_err());
@@ -1931,16 +1957,19 @@ async fn clearing_or_replacing_the_lease_reaches_every_scoped_surface() {
     let id = uuid::Uuid::new_v4().to_string();
     let leases = Leases::disconnected();
     leases
-        .authorize_scope("vendor-scope", [&id])
+        .authorize_scope(vendor_scope(), [&id])
         .expect("authorize");
     leases
-        .install_handoff(&handoff_document(&epoch_id, &[(&id, b"vendor-key")]), epoch)
+        .install_handoff(
+            &handoff_document(&epoch_id, &[(&id, secret_a().as_bytes())]),
+            epoch,
+        )
         .expect("install");
     let target = scoped_target();
     leases
         .replace_target_scopes(
             ScopeOwner::new(),
-            [(&target, "vendor-scope", ProviderCredential::ApiKey)],
+            [(&target, vendor_scope(), ProviderCredential::ApiKey)],
         )
         .expect("bind");
     resolve_for_target(&leases, &target)
@@ -1972,7 +2001,7 @@ async fn clearing_or_replacing_the_lease_reaches_every_scoped_surface() {
         vec![
             LeasedCredential::new(
                 uuid::Uuid::new_v4().to_string(),
-                SecretBytes::try_from_bytes(b"fresh-key".to_vec()).expect("secret"),
+                SecretBytes::try_from_bytes(secret_a().as_bytes().to_vec()).expect("secret"),
                 None,
             )
             .expect("credential"),
@@ -1999,7 +2028,7 @@ async fn clearing_or_replacing_the_lease_reaches_every_scoped_surface() {
         .await
         .expect("replacement resolves")
     {
-        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), "fresh-key"),
+        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), secret_a()),
         other => panic!("expected an api-key credential: {other:?}"),
     }
 }
@@ -2017,19 +2046,19 @@ async fn authorizing_a_scope_late_never_extends_the_installed_expiry() {
     let leases = Leases::disconnected();
     leases
         .install_handoff(
-            &handoff_document_for(&epoch_id, &[(&id, b"vendor-key")], 1),
+            &handoff_document_for(&epoch_id, &[(&id, secret_a().as_bytes())], 1),
             epoch,
         )
         .expect("install");
     std::thread::sleep(Duration::from_millis(1300));
     leases
-        .authorize_scope("vendor-scope", [&id])
+        .authorize_scope(vendor_scope(), [&id])
         .expect("authorize");
     let target = scoped_target();
     leases
         .replace_target_scopes(
             ScopeOwner::new(),
-            [(&target, "vendor-scope", ProviderCredential::ApiKey)],
+            [(&target, vendor_scope(), ProviderCredential::ApiKey)],
         )
         .expect("bind");
     let error = resolve_for_target(&leases, &target)
@@ -2060,11 +2089,11 @@ async fn a_reinstalled_handoff_replaces_the_whole_lease_state() {
     let epoch_b = uuid::Uuid::new_v4().to_string();
     let leases = Leases::disconnected();
     leases
-        .authorize_scope("vendor-scope", [&id_a, &id_b])
+        .authorize_scope(vendor_scope(), [&id_a, &id_b])
         .expect("authorize");
     leases
         .install_handoff(
-            &handoff_document(&epoch_a, &[(&id_a, b"key-a")]),
+            &handoff_document(&epoch_a, &[(&id_a, secret_a().as_bytes())]),
             Arc::new(Epochs {
                 current: Mutex::new(epoch_a),
             }),
@@ -2074,19 +2103,19 @@ async fn a_reinstalled_handoff_replaces_the_whole_lease_state() {
     leases
         .replace_target_scopes(
             ScopeOwner::new(),
-            [(&target, "vendor-scope", ProviderCredential::ApiKey)],
+            [(&target, vendor_scope(), ProviderCredential::ApiKey)],
         )
         .expect("bind");
     match resolve_for_target(&leases, &target)
         .await
         .expect("scoped a")
     {
-        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), "key-a"),
+        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), secret_a()),
         other => panic!("expected an api-key credential: {other:?}"),
     }
     leases
         .install_handoff(
-            &handoff_document(&epoch_b, &[(&id_b, b"key-b")]),
+            &handoff_document(&epoch_b, &[(&id_b, secret_b().as_bytes())]),
             Arc::new(Epochs {
                 current: Mutex::new(epoch_b),
             }),
@@ -2096,11 +2125,11 @@ async fn a_reinstalled_handoff_replaces_the_whole_lease_state() {
         .await
         .expect("scoped b")
     {
-        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), "key-b"),
+        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), secret_b()),
         other => panic!("expected an api-key credential: {other:?}"),
     }
     match resolve_unscoped(&leases).await.expect("unscoped b") {
-        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), "key-b"),
+        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), secret_b()),
         other => panic!("expected an api-key credential: {other:?}"),
     }
 }
@@ -2153,8 +2182,8 @@ fn replacing_a_route_releases_its_scope_binding() {
     let id_a = uuid::Uuid::new_v4().to_string();
     let id_b = uuid::Uuid::new_v4().to_string();
     let leases = Arc::new(Leases::disconnected());
-    leases.authorize_scope("scope-a", [&id_a]).expect("a");
-    leases.authorize_scope("scope-b", [&id_b]).expect("b");
+    leases.authorize_scope(scope_a(), [&id_a]).expect("a");
+    leases.authorize_scope(scope_b(), [&id_b]).expect("b");
     let mut router = Router::with_leases(loopback_transport(), leases);
     let endpoint = || {
         EndpointRoute::from_document(&serde_json::json!({
@@ -2166,15 +2195,15 @@ fn replacing_a_route_releases_its_scope_binding() {
         .1
     };
     router
-        .add_endpoint_route_scoped("m", endpoint(), "scope-a")
+        .add_endpoint_route_scoped("m", endpoint(), scope_a())
         .expect("scoped m");
-    assert_eq!(router.credential_scope("m"), Some("scope-a"));
+    assert_eq!(router.credential_scope("m"), Some(scope_a()));
     // Re-scoping the same model onto the same surface replaces the
     // binding rather than conflicting with it.
     router
-        .add_endpoint_route_scoped("m", endpoint(), "scope-b")
+        .add_endpoint_route_scoped("m", endpoint(), scope_b())
         .expect("rescoped m");
-    assert_eq!(router.credential_scope("m"), Some("scope-b"));
+    assert_eq!(router.credential_scope("m"), Some(scope_b()));
     // Replacing it with an unscoped route frees the surface entirely.
     let unscoped = EndpointRoute::from_document(&serde_json::json!({
         "model": "m",
@@ -2187,9 +2216,9 @@ fn replacing_a_route_releases_its_scope_binding() {
         .expect("unscoped m");
     assert_eq!(router.credential_scope("m"), None);
     router
-        .add_endpoint_route_scoped("m2", endpoint(), "scope-a")
+        .add_endpoint_route_scoped("m2", endpoint(), scope_a())
         .expect("the freed surface binds a new scope");
-    assert_eq!(router.credential_scope("m2"), Some("scope-a"));
+    assert_eq!(router.credential_scope("m2"), Some(scope_a()));
 }
 
 #[tokio::test]
@@ -2206,7 +2235,7 @@ async fn a_late_scoped_slot_dies_at_the_install_deadline() {
     let leases = Leases::disconnected();
     leases
         .install_handoff(
-            &handoff_document_for(&epoch_id, &[(&id, b"vendor-key")], 3),
+            &handoff_document_for(&epoch_id, &[(&id, secret_a().as_bytes())], 3),
             epoch,
         )
         .expect("install");
@@ -2214,20 +2243,20 @@ async fn a_late_scoped_slot_dies_at_the_install_deadline() {
     // resolves — the remaining lifetime gates creation, not use.
     std::thread::sleep(Duration::from_millis(1200));
     leases
-        .authorize_scope("vendor-scope", [&id])
+        .authorize_scope(vendor_scope(), [&id])
         .expect("authorize");
     let target = scoped_target();
     leases
         .replace_target_scopes(
             ScopeOwner::new(),
-            [(&target, "vendor-scope", ProviderCredential::ApiKey)],
+            [(&target, vendor_scope(), ProviderCredential::ApiKey)],
         )
         .expect("bind");
     match resolve_for_target(&leases, &target)
         .await
         .expect("scoped resolves inside the lease")
     {
-        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), "vendor-key"),
+        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), secret_a()),
         other => panic!("expected an api-key credential: {other:?}"),
     }
     // Past the install's deadline the slot must not answer — the
@@ -2255,23 +2284,33 @@ async fn reauthorizing_a_scope_commits_the_new_ids_with_their_slot() {
     let leases = Leases::disconnected();
     leases
         .install_handoff(
-            &handoff_document(&epoch_id, &[(&id_a, b"key-a"), (&id_b, b"key-b")]),
+            &handoff_document(
+                &epoch_id,
+                &[
+                    (&id_a, secret_a().as_bytes()),
+                    (&id_b, secret_b().as_bytes()),
+                ],
+            ),
             epoch,
         )
         .expect("install");
     leases
-        .authorize_scope("vendor-scope", [&id_a])
+        .authorize_scope(vendor_scope(), [&id_a])
         .expect("authorize");
     let target = scoped_target();
     leases
         .replace_target_scopes(
             ScopeOwner::new(),
-            [(&target, "vendor-scope", ProviderCredential::ApiKey)],
+            [(&target, vendor_scope(), ProviderCredential::ApiKey)],
         )
         .expect("bind");
-    for (id, secret) in [(&id_a, "key-a"), (&id_b, "key-b"), (&id_a, "key-a")] {
+    for (id, secret) in [
+        (&id_a, secret_a()),
+        (&id_b, secret_b()),
+        (&id_a, secret_a()),
+    ] {
         leases
-            .authorize_scope("vendor-scope", [id])
+            .authorize_scope(vendor_scope(), [id])
             .expect("authorize");
         match resolve_for_target(&leases, &target)
             .await
@@ -2301,10 +2340,13 @@ async fn a_sibling_routers_publish_never_erases_the_live_bindings() {
         .authorize_scope("ghost-scope", [&ghost])
         .expect("ghost scope");
     leases
-        .authorize_scope("vendor-scope", [&id])
+        .authorize_scope(vendor_scope(), [&id])
         .expect("vendor scope");
     leases
-        .install_handoff(&handoff_document(&epoch_id, &[(&id, b"vendor-key")]), epoch)
+        .install_handoff(
+            &handoff_document(&epoch_id, &[(&id, secret_a().as_bytes())]),
+            epoch,
+        )
         .expect("install");
     let endpoint = |base_url: &str| {
         EndpointRoute::from_document(&serde_json::json!({
@@ -2361,7 +2403,7 @@ async fn a_sibling_routers_publish_never_erases_the_live_bindings() {
         .add_endpoint_route_scoped(
             "m-c",
             endpoint("https://a.vendor.example/v1"),
-            "vendor-scope",
+            vendor_scope(),
         )
         .expect_err("a foreign-held surface refuses a conflicting scope");
     assert!(error.to_string().contains("conflict"), "{error}");
@@ -2426,10 +2468,13 @@ async fn a_detached_scoped_adapter_fails_closed_when_its_binding_retires() {
     let id = uuid::Uuid::new_v4().to_string();
     let leases = Arc::new(Leases::disconnected());
     leases
-        .authorize_scope("vendor-scope", [&id])
+        .authorize_scope(vendor_scope(), [&id])
         .expect("scope");
     leases
-        .install_handoff(&handoff_document(&epoch_id, &[(&id, b"vendor-key")]), epoch)
+        .install_handoff(
+            &handoff_document(&epoch_id, &[(&id, secret_a().as_bytes())]),
+            epoch,
+        )
         .expect("install");
     let endpoint = |base_url: &str| {
         EndpointRoute::from_document(&serde_json::json!({
@@ -2442,7 +2487,7 @@ async fn a_detached_scoped_adapter_fails_closed_when_its_binding_retires() {
     };
     let mut router = Router::with_leases(loopback_transport(), Arc::clone(&leases));
     router
-        .add_endpoint_route_scoped("m", endpoint("https://a.vendor.example/v1"), "vendor-scope")
+        .add_endpoint_route_scoped("m", endpoint("https://a.vendor.example/v1"), vendor_scope())
         .expect("declare");
     let surface = router
         .resolve("m")
@@ -2454,7 +2499,7 @@ async fn a_detached_scoped_adapter_fails_closed_when_its_binding_retires() {
         .await
         .expect("scoped while bound")
     {
-        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), "vendor-key"),
+        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), secret_a()),
         other => panic!("expected an api-key credential: {other:?}"),
     }
 
@@ -2481,14 +2526,14 @@ async fn a_detached_scoped_adapter_fails_closed_when_its_binding_retires() {
         .add_endpoint_route_scoped(
             "m2",
             endpoint("https://a.vendor.example/v1"),
-            "vendor-scope",
+            vendor_scope(),
         )
         .expect("the retired surface binds again under its scope");
     match resolve_for_target(&leases, &surface)
         .await
         .expect("rebound scoped resolves")
     {
-        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), "vendor-key"),
+        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), secret_a()),
         other => panic!("expected an api-key credential: {other:?}"),
     }
 }
@@ -2502,7 +2547,7 @@ fn a_declared_route_and_a_prebound_adapter_never_share_a_model() {
     let id = uuid::Uuid::new_v4().to_string();
     let leases = Arc::new(Leases::disconnected());
     leases
-        .authorize_scope("vendor-scope", [&id])
+        .authorize_scope(vendor_scope(), [&id])
         .expect("scope");
     let endpoint = || {
         EndpointRoute::from_document(&serde_json::json!({
@@ -2524,20 +2569,20 @@ fn a_declared_route_and_a_prebound_adapter_never_share_a_model() {
         .register_adapter("m", "upstream-m", adapter())
         .expect("prebound");
     let error = router
-        .add_endpoint_route_scoped("m", endpoint(), "vendor-scope")
+        .add_endpoint_route_scoped("m", endpoint(), vendor_scope())
         .expect_err("a declared route refuses a prebound name");
     assert!(error.to_string().contains("host-registered"), "{error}");
     assert!(router.credential_scope("m").is_none());
 
     let mut router = Router::with_leases(loopback_transport(), Arc::clone(&leases));
     router
-        .add_endpoint_route_scoped("m", endpoint(), "vendor-scope")
+        .add_endpoint_route_scoped("m", endpoint(), vendor_scope())
         .expect("declare");
     let error = router
         .register_adapter("m", "upstream-m", adapter())
         .expect_err("a prebound adapter refuses a declared name");
     assert!(error.to_string().contains("declared route"), "{error}");
-    assert_eq!(router.credential_scope("m"), Some("vendor-scope"));
+    assert_eq!(router.credential_scope("m"), Some(vendor_scope()));
 }
 
 #[tokio::test]
@@ -2555,26 +2600,26 @@ async fn a_short_lease_still_materializes_its_scoped_slots() {
     let leases = Leases::disconnected();
     leases
         .install_handoff(
-            &handoff_document_for(&epoch_id, &[(&id, b"vendor-key")], 1),
+            &handoff_document_for(&epoch_id, &[(&id, secret_a().as_bytes())], 1),
             epoch,
         )
         .expect("install");
     std::thread::sleep(Duration::from_millis(200));
     leases
-        .authorize_scope("vendor-scope", [&id])
+        .authorize_scope(vendor_scope(), [&id])
         .expect("authorize");
     let target = scoped_target();
     leases
         .replace_target_scopes(
             ScopeOwner::new(),
-            [(&target, "vendor-scope", ProviderCredential::ApiKey)],
+            [(&target, vendor_scope(), ProviderCredential::ApiKey)],
         )
         .expect("bind");
     match resolve_for_target(&leases, &target)
         .await
         .expect("a positive remaining duration still mints")
     {
-        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), "vendor-key"),
+        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), secret_a()),
         other => panic!("expected an api-key credential: {other:?}"),
     }
 
@@ -2604,11 +2649,17 @@ async fn a_dropped_router_releases_its_scope_bindings() {
     let id_a = uuid::Uuid::new_v4().to_string();
     let id_b = uuid::Uuid::new_v4().to_string();
     let leases = Arc::new(Leases::disconnected());
-    leases.authorize_scope("scope-a", [&id_a]).expect("a");
-    leases.authorize_scope("scope-b", [&id_b]).expect("b");
+    leases.authorize_scope(scope_a(), [&id_a]).expect("a");
+    leases.authorize_scope(scope_b(), [&id_b]).expect("b");
     leases
         .install_handoff(
-            &handoff_document(&epoch_id, &[(&id_a, b"key-a"), (&id_b, b"key-b")]),
+            &handoff_document(
+                &epoch_id,
+                &[
+                    (&id_a, secret_a().as_bytes()),
+                    (&id_b, secret_b().as_bytes()),
+                ],
+            ),
             epoch,
         )
         .expect("install");
@@ -2625,7 +2676,7 @@ async fn a_dropped_router_releases_its_scope_bindings() {
     let surface = {
         let mut router_a = Router::with_leases(loopback_transport(), Arc::clone(&leases));
         router_a
-            .add_endpoint_route_scoped("m", endpoint(), "scope-a")
+            .add_endpoint_route_scoped("m", endpoint(), scope_a())
             .expect("declare");
         router_a
             .resolve("m")
@@ -2650,9 +2701,9 @@ async fn a_dropped_router_releases_its_scope_bindings() {
     // scope — the retired slice no longer conflicts.
     let mut router_b = Router::with_leases(loopback_transport(), Arc::clone(&leases));
     router_b
-        .add_endpoint_route_scoped("m", endpoint(), "scope-b")
+        .add_endpoint_route_scoped("m", endpoint(), scope_b())
         .expect("the freed surface binds a new scope");
-    assert_eq!(router_b.credential_scope("m"), Some("scope-b"));
+    assert_eq!(router_b.credential_scope("m"), Some(scope_b()));
 }
 
 #[tokio::test]
@@ -2669,11 +2720,17 @@ async fn a_detached_adapter_stays_pinned_to_its_declared_scope() {
     let id_a = uuid::Uuid::new_v4().to_string();
     let id_b = uuid::Uuid::new_v4().to_string();
     let leases = Arc::new(Leases::disconnected());
-    leases.authorize_scope("scope-a", [&id_a]).expect("a");
-    leases.authorize_scope("scope-b", [&id_b]).expect("b");
+    leases.authorize_scope(scope_a(), [&id_a]).expect("a");
+    leases.authorize_scope(scope_b(), [&id_b]).expect("b");
     leases
         .install_handoff(
-            &handoff_document(&epoch_id, &[(&id_a, b"key-a"), (&id_b, b"key-b")]),
+            &handoff_document(
+                &epoch_id,
+                &[
+                    (&id_a, secret_a().as_bytes()),
+                    (&id_b, secret_b().as_bytes()),
+                ],
+            ),
             epoch,
         )
         .expect("install");
@@ -2703,7 +2760,7 @@ async fn a_detached_adapter_stays_pinned_to_its_declared_scope() {
         .1
     };
     router
-        .add_endpoint_route_scoped("m", endpoint(), "scope-a")
+        .add_endpoint_route_scoped("m", endpoint(), scope_a())
         .expect("declare");
     let surface = router
         .resolve("m")
@@ -2725,14 +2782,14 @@ async fn a_detached_adapter_stays_pinned_to_its_declared_scope() {
         .await
         .expect("the declared scope resolves")
     {
-        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), "key-a"),
+        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), secret_a()),
         other => panic!("expected an api-key credential: {other:?}"),
     }
 
     // Rebind the same surface to another scope: the port answers the
     // live binding while the retained adapter's pin refuses.
     router
-        .add_endpoint_route_scoped("m", endpoint(), "scope-b")
+        .add_endpoint_route_scoped("m", endpoint(), scope_b())
         .expect("rebind");
     let error = a4mp::CredentialResolver::resolve(pinned.as_ref(), pinned_scope())
         .await
@@ -2742,7 +2799,7 @@ async fn a_detached_adapter_stays_pinned_to_its_declared_scope() {
         .await
         .expect("the live binding resolves")
     {
-        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), "key-b"),
+        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), secret_b()),
         other => panic!("expected an api-key credential: {other:?}"),
     }
 }
@@ -2785,9 +2842,12 @@ async fn a_retained_adapter_dies_with_its_own_binding_owner() {
     let epoch_id = epoch.current.lock().unwrap().clone();
     let id = uuid::Uuid::new_v4().to_string();
     let leases = Arc::new(Leases::disconnected());
-    leases.authorize_scope("scope-a", [&id]).expect("scope");
+    leases.authorize_scope(scope_a(), [&id]).expect("scope");
     leases
-        .install_handoff(&handoff_document(&epoch_id, &[(&id, b"key-a")]), epoch)
+        .install_handoff(
+            &handoff_document(&epoch_id, &[(&id, secret_a().as_bytes())]),
+            epoch,
+        )
         .expect("install");
 
     // A catalog whose adapter factory records the resolver each bind
@@ -2819,7 +2879,7 @@ async fn a_retained_adapter_dies_with_its_own_binding_owner() {
     let mut router_a =
         Router::with_catalog_leases(catalog(), loopback_transport(), Arc::clone(&leases));
     router_a
-        .add_endpoint_route_scoped("m", endpoint(), "scope-a")
+        .add_endpoint_route_scoped("m", endpoint(), scope_a())
         .expect("declare a");
     let surface = router_a
         .resolve("m")
@@ -2830,7 +2890,7 @@ async fn a_retained_adapter_dies_with_its_own_binding_owner() {
     let mut router_b =
         Router::with_catalog_leases(catalog(), loopback_transport(), Arc::clone(&leases));
     router_b
-        .add_endpoint_route_scoped("m", endpoint(), "scope-a")
+        .add_endpoint_route_scoped("m", endpoint(), scope_a())
         .expect("declare b — the same binding under another owner");
     router_b.resolve("m").expect("resolve b");
 
@@ -2847,7 +2907,7 @@ async fn a_retained_adapter_dies_with_its_own_binding_owner() {
         .await
         .expect("the shared binding resolves while both owners live")
     {
-        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), "key-a"),
+        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), secret_a()),
         other => panic!("expected an api-key credential: {other:?}"),
     }
 
@@ -2863,7 +2923,7 @@ async fn a_retained_adapter_dies_with_its_own_binding_owner() {
         .await
         .expect("the sibling's live binding keeps forwarding")
     {
-        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), "key-a"),
+        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), secret_a()),
         other => panic!("expected an api-key credential: {other:?}"),
     }
 
@@ -2872,7 +2932,7 @@ async fn a_retained_adapter_dies_with_its_own_binding_owner() {
     let mut router_c =
         Router::with_catalog_leases(catalog(), loopback_transport(), Arc::clone(&leases));
     router_c
-        .add_endpoint_route_scoped("m", endpoint(), "scope-a")
+        .add_endpoint_route_scoped("m", endpoint(), scope_a())
         .expect("declare c");
     let error = a4mp::CredentialResolver::resolve(pinned_a.as_ref(), pinned_scope())
         .await
@@ -2897,10 +2957,13 @@ async fn an_unauthenticated_route_forwards_over_a_retired_surface() {
     let id = uuid::Uuid::new_v4().to_string();
     let leases = Arc::new(Leases::disconnected());
     leases
-        .authorize_scope("vendor-scope", [&id])
+        .authorize_scope(vendor_scope(), [&id])
         .expect("scope");
     leases
-        .install_handoff(&handoff_document(&epoch_id, &[(&id, b"vendor-key")]), epoch)
+        .install_handoff(
+            &handoff_document(&epoch_id, &[(&id, secret_a().as_bytes())]),
+            epoch,
+        )
         .expect("install");
     let endpoint = |auth: &str| {
         EndpointRoute::from_document(&serde_json::json!({
@@ -2914,7 +2977,7 @@ async fn an_unauthenticated_route_forwards_over_a_retired_surface() {
 
     let mut router = Router::with_leases(loopback_transport(), Arc::clone(&leases));
     router
-        .add_endpoint_route_scoped("m", endpoint("api-key"), "vendor-scope")
+        .add_endpoint_route_scoped("m", endpoint("api-key"), vendor_scope())
         .expect("declare scoped");
     let surface = router
         .resolve("m")
@@ -2969,9 +3032,12 @@ async fn a_scoped_custom_factory_receives_the_declared_target() {
     let epoch_id = epoch.current.lock().unwrap().clone();
     let id = uuid::Uuid::new_v4().to_string();
     let leases = Arc::new(Leases::disconnected());
-    leases.authorize_scope("scope-a", [&id]).expect("scope");
+    leases.authorize_scope(scope_a(), [&id]).expect("scope");
     leases
-        .install_handoff(&handoff_document(&epoch_id, &[(&id, b"key-a")]), epoch)
+        .install_handoff(
+            &handoff_document(&epoch_id, &[(&id, secret_a().as_bytes())]),
+            epoch,
+        )
         .expect("install");
 
     let produced: Arc<Mutex<Vec<a4mp::ServiceTarget>>> = Arc::new(Mutex::new(Vec::new()));
@@ -3004,7 +3070,7 @@ async fn a_scoped_custom_factory_receives_the_declared_target() {
             }))
             .expect("route")
             .1,
-            "scope-a",
+            scope_a(),
         )
         .expect("declare");
 
@@ -3046,7 +3112,7 @@ async fn a_scoped_custom_factory_receives_the_declared_target() {
     .await
     .expect("the registered surface resolves its scope")
     {
-        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), "key-a"),
+        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), secret_a()),
         other => panic!("expected an api-key credential: {other:?}"),
     }
 }
@@ -3063,9 +3129,12 @@ async fn a_republished_binding_is_a_new_generation_for_retained_adapters() {
     let epoch_id = epoch.current.lock().unwrap().clone();
     let id = uuid::Uuid::new_v4().to_string();
     let leases = Arc::new(Leases::disconnected());
-    leases.authorize_scope("scope-a", [&id]).expect("scope");
+    leases.authorize_scope(scope_a(), [&id]).expect("scope");
     leases
-        .install_handoff(&handoff_document(&epoch_id, &[(&id, b"key-a")]), epoch)
+        .install_handoff(
+            &handoff_document(&epoch_id, &[(&id, secret_a().as_bytes())]),
+            epoch,
+        )
         .expect("install");
 
     let resolvers: Arc<Mutex<Vec<Arc<dyn a4mp::CredentialResolver>>>> =
@@ -3091,7 +3160,7 @@ async fn a_republished_binding_is_a_new_generation_for_retained_adapters() {
     let mut router =
         Router::with_catalog_leases(catalog, loopback_transport(), Arc::clone(&leases));
     router
-        .add_endpoint_route_scoped("m", endpoint("https://a.vendor.example/v1"), "scope-a")
+        .add_endpoint_route_scoped("m", endpoint("https://a.vendor.example/v1"), scope_a())
         .expect("declare m");
     let surface_a = router
         .resolve("m")
@@ -3116,14 +3185,14 @@ async fn a_republished_binding_is_a_new_generation_for_retained_adapters() {
         .await
         .expect("the live binding resolves")
     {
-        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), "key-a"),
+        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), secret_a()),
         other => panic!("expected an api-key credential: {other:?}"),
     }
 
     // A republish adding a sibling route leaves m's binding untouched:
     // the retained pin — generation and all — keeps resolving.
     router
-        .add_endpoint_route_scoped("m2", endpoint("https://b.vendor.example/v1"), "scope-a")
+        .add_endpoint_route_scoped("m2", endpoint("https://b.vendor.example/v1"), scope_a())
         .expect("declare m2");
     a4mp::CredentialResolver::resolve(pinned.as_ref(), pinned_scope())
         .await
@@ -3151,7 +3220,7 @@ async fn a_republished_binding_is_a_new_generation_for_retained_adapters() {
     // Publish the same surface and scope again: a different binding —
     // the retained adapter's pin never regains credentials.
     router
-        .add_endpoint_route_scoped("m3", endpoint("https://a.vendor.example/v1"), "scope-a")
+        .add_endpoint_route_scoped("m3", endpoint("https://a.vendor.example/v1"), scope_a())
         .expect("the identical republish declares");
     let error = a4mp::CredentialResolver::resolve(pinned.as_ref(), pinned_scope())
         .await
@@ -3173,7 +3242,7 @@ async fn a_republished_binding_is_a_new_generation_for_retained_adapters() {
         .await
         .expect("the republished binding resolves for its own pin")
     {
-        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), "key-a"),
+        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), secret_a()),
         other => panic!("expected an api-key credential: {other:?}"),
     }
 }
@@ -3210,9 +3279,12 @@ async fn a_scoped_resolver_answers_only_its_declared_binding() {
     let epoch_id = epoch.current.lock().unwrap().clone();
     let id = uuid::Uuid::new_v4().to_string();
     let leases = Arc::new(Leases::disconnected());
-    leases.authorize_scope("scope-a", [&id]).expect("scope");
+    leases.authorize_scope(scope_a(), [&id]).expect("scope");
     leases
-        .install_handoff(&handoff_document(&epoch_id, &[(&id, b"key-a")]), epoch)
+        .install_handoff(
+            &handoff_document(&epoch_id, &[(&id, secret_a().as_bytes())]),
+            epoch,
+        )
         .expect("install");
 
     let resolvers: Arc<Mutex<Vec<Arc<dyn a4mp::CredentialResolver>>>> =
@@ -3247,10 +3319,10 @@ async fn a_scoped_resolver_answers_only_its_declared_binding() {
     let mut router =
         Router::with_catalog_leases(catalog, loopback_transport(), Arc::clone(&leases));
     router
-        .add_endpoint_route_scoped("m1", endpoint("https://a.vendor.example/v1"), "scope-a")
+        .add_endpoint_route_scoped("m1", endpoint("https://a.vendor.example/v1"), scope_a())
         .expect("declare m1");
     router
-        .add_endpoint_route_scoped("m2", endpoint("https://b.vendor.example/v1"), "scope-a")
+        .add_endpoint_route_scoped("m2", endpoint("https://b.vendor.example/v1"), scope_a())
         .expect("declare m2");
 
     // Both declaration binds resolved nothing: the factory saw the
@@ -3285,7 +3357,7 @@ async fn a_scoped_resolver_answers_only_its_declared_binding() {
     .await
     .expect("the declared surface and mechanism resolve")
     {
-        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), "key-a"),
+        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), secret_a()),
         other => panic!("expected an api-key credential: {other:?}"),
     }
     // The sibling surface shares the owner's slice and scope — and is
@@ -3329,7 +3401,7 @@ fn a_transformed_target_must_pass_the_bound_surface_policy() {
     // nothing commits.
     let id = uuid::Uuid::new_v4().to_string();
     let leases = Arc::new(Leases::disconnected());
-    leases.authorize_scope("scope-a", [&id]).expect("scope");
+    leases.authorize_scope(scope_a(), [&id]).expect("scope");
     let endpoint = || {
         EndpointRoute::from_document(&serde_json::json!({
             "model": "m",
@@ -3362,7 +3434,7 @@ fn a_transformed_target_must_pass_the_bound_surface_policy() {
         Arc::clone(&leases),
     );
     let error = router
-        .add_endpoint_route_scoped("m", endpoint(), "scope-a")
+        .add_endpoint_route_scoped("m", endpoint(), scope_a())
         .expect_err("a cleartext-public output refuses");
     assert!(error.to_string().contains("cleartext"), "{error}");
     assert!(router.resolve("m").is_err());
@@ -3378,7 +3450,7 @@ fn a_transformed_target_must_pass_the_bound_surface_policy() {
         Arc::clone(&leases),
     );
     let error = router
-        .add_endpoint_route_scoped("m", endpoint(), "scope-a")
+        .add_endpoint_route_scoped("m", endpoint(), scope_a())
         .expect_err("a credential-bearing output refuses");
     assert!(error.to_string().contains("bound target"), "{error}");
     assert!(router.resolve("m").is_err());
@@ -3405,7 +3477,7 @@ fn a_transformed_target_must_pass_the_bound_surface_policy() {
         vars: Default::default(),
     };
     let error = router
-        .add_route_scoped("m", route, "scope-a")
+        .add_route_scoped("m", route, scope_a())
         .expect_err("a cleartext-public profile output refuses");
     assert!(error.to_string().contains("cleartext"), "{error}");
     assert!(router.resolve("m").is_err());
@@ -3451,15 +3523,15 @@ async fn a_rebound_mechanism_retires_the_old_binding() {
     let token_id = uuid::Uuid::new_v4().to_string();
     let leases = Arc::new(Leases::disconnected());
     leases
-        .authorize_scope("scope-a", [&key_id, &token_id])
+        .authorize_scope(scope_a(), [&key_id, &token_id])
         .expect("scope");
     leases
         .install_handoff(
             &handoff_document_kinds(
                 &epoch_id,
                 &[
-                    (ProviderCredential::ApiKey, &key_id, b"key-a"),
-                    (ProviderCredential::Bearer, &token_id, b"token-a"),
+                    (ProviderCredential::ApiKey, &key_id, secret_a().as_bytes()),
+                    (ProviderCredential::Bearer, &token_id, secret_b().as_bytes()),
                 ],
             ),
             epoch,
@@ -3497,7 +3569,7 @@ async fn a_rebound_mechanism_retires_the_old_binding() {
     let mut router =
         Router::with_catalog_leases(catalog, loopback_transport(), Arc::clone(&leases));
     router
-        .add_endpoint_route_scoped("m", endpoint("api-key"), "scope-a")
+        .add_endpoint_route_scoped("m", endpoint("api-key"), scope_a())
         .expect("declare m");
     let surface_a = router
         .resolve("m")
@@ -3527,7 +3599,7 @@ async fn a_rebound_mechanism_retires_the_old_binding() {
         .await
         .expect("the api-key binding resolves")
     {
-        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), "key-a"),
+        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), secret_a()),
         other => panic!("expected an api-key credential: {other:?}"),
     }
 
@@ -3535,10 +3607,10 @@ async fn a_rebound_mechanism_retires_the_old_binding() {
     // api-key binding alive while m itself swaps to bearer: the publish
     // drops m's stake but not the binding m2 shares.
     router
-        .add_endpoint_route_scoped("m2", endpoint("api-key"), "scope-a")
+        .add_endpoint_route_scoped("m2", endpoint("api-key"), scope_a())
         .expect("declare m2");
     router
-        .add_endpoint_route_scoped("m", endpoint("bearer"), "scope-a")
+        .add_endpoint_route_scoped("m", endpoint("bearer"), scope_a())
         .expect("m swaps mechanism");
     a4mp::CredentialResolver::resolve(pinned.as_ref(), api_key_scope())
         .await
@@ -3570,7 +3642,7 @@ async fn a_rebound_mechanism_retires_the_old_binding() {
         .await
         .expect("the bearer binding resolves")
     {
-        a4mp::Credential::Bearer { token, .. } => assert_eq!(token.expose(), "token-a"),
+        a4mp::Credential::Bearer { token, .. } => assert_eq!(token.expose(), secret_b()),
         other => panic!("expected a bearer credential: {other:?}"),
     }
 }

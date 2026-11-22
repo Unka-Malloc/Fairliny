@@ -1477,6 +1477,14 @@ mod tests {
         }
     }
 
+    /// A scope name for declaration fixtures — generated once for the
+    /// whole test binary so fixtures never carry a static scope
+    /// identifier that reads as checked-in material.
+    fn vendor_scope() -> &'static str {
+        static SCOPE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        SCOPE.get_or_init(|| uuid::Uuid::new_v4().to_string())
+    }
+
     /// A router over the built-in catalog whose transport is never
     /// invoked — declaration binds adapters but sends nothing — and
     /// whose lease port authorizes `vendor-scope`, the resolver shape
@@ -1484,7 +1492,7 @@ mod tests {
     fn declaring_router() -> Router {
         let leases = Arc::new(Leases::disconnected());
         leases
-            .authorize_scope("vendor-scope", [uuid::Uuid::new_v4().to_string()])
+            .authorize_scope(vendor_scope(), [uuid::Uuid::new_v4().to_string()])
             .expect("authorize");
         Router::with_leases(Arc::new(a4mp::ReqwestTransport::new()), leases)
     }
@@ -1496,7 +1504,7 @@ mod tests {
     /// An api-key endpoint entry plus the scope it declares — the shape
     /// every leased-auth document entry must take.
     fn scoped_entry(mut entry: Value) -> Value {
-        entry["credentialScope"] = "vendor-scope".into();
+        entry["credentialScope"] = vendor_scope().into();
         entry
     }
 
@@ -1530,7 +1538,7 @@ mod tests {
 
         let mut router = declaring_router();
         router
-            .add_endpoint_route_scoped(model, route, "vendor-scope")
+            .add_endpoint_route_scoped(model, route, vendor_scope())
             .expect("declared");
         let bound = router.resolve("vendor-chat").expect("bound");
         assert_eq!(bound.provider.as_str(), CUSTOM_PROVIDER);
@@ -1590,10 +1598,10 @@ mod tests {
         // the entry would pretend an authorization it does not have.
         for entry in [
             serde_json::json!({"model": "m", "provider": "ollama", "auth": "none",
-                               "credentialScope": "s",
+                               "credentialScope": vendor_scope(),
                                "vars": {"endpoint": "https://a.example"}}),
             serde_json::json!({"model": "m", "endpoint": endpoint,
-                               "auth": "none", "credentialScope": "s"}),
+                               "auth": "none", "credentialScope": vendor_scope()}),
         ] {
             let error = declare(entry).expect_err("scope on none");
             assert!(error.to_string().contains("does not apply"), "{error}");
@@ -1717,15 +1725,16 @@ mod tests {
         assert!(
             EndpointRoute::from_document(&entry("not a url", "openai-chat-completions")).is_err()
         );
+        let leak = uuid::Uuid::new_v4().to_string();
         for url in [
-            "ftp://a.example/v1",
-            "https://user:hunter2@a.example/v1",
-            "https://a.example/v1?key=hunter2",
-            "https://a.example/v1#frag",
+            "ftp://a.example/v1".to_owned(),
+            format!("https://user:{leak}@a.example/v1"),
+            format!("https://a.example/v1?key={leak}"),
+            "https://a.example/v1#frag".to_owned(),
         ] {
-            let error = declare(entry(url, "openai-chat-completions")).expect_err(url);
+            let error = declare(entry(&url, "openai-chat-completions")).expect_err(&url);
             assert!(error.to_string().contains("baseUrl"), "{url}: {error}");
-            assert!(!error.to_string().contains("hunter2"), "{url}: {error}");
+            assert!(!error.to_string().contains(&leak), "{url}: {error}");
         }
     }
 
@@ -1787,7 +1796,7 @@ mod tests {
         );
         let leases = Arc::new(Leases::disconnected());
         leases
-            .authorize_scope("vendor-scope", [uuid::Uuid::new_v4().to_string()])
+            .authorize_scope(vendor_scope(), [uuid::Uuid::new_v4().to_string()])
             .expect("authorize");
         let mut router =
             Router::with_catalog_leases(catalog, Arc::new(a4mp::ReqwestTransport::new()), leases);
@@ -1834,7 +1843,7 @@ mod tests {
             "model": "m",
             "endpoint": {"baseUrl": "http://models.internal:8000/v1", "protocol": "openai-chat-completions"},
             "auth": "api-key",
-            "credentialScope": "vendor-scope"
+            "credentialScope": vendor_scope()
         }))
         .expect_err("cleartext to a non-loopback authority refuses");
         assert!(error.to_string().contains("cleartext"), "{error}");
