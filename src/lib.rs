@@ -33,6 +33,7 @@ pub mod leases;
 pub mod meter;
 pub mod router;
 pub mod service;
+pub mod transport;
 
 pub use error::Error;
 

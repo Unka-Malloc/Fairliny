@@ -155,17 +155,23 @@ fn install_handoff_if_offered(leases: &Leases) -> Result<()> {
     }
 }
 
-/// The sidecar's HTTP client. Redirects are never followed: the router
-/// validates the configured endpoint origin, and a redirect could carry
-/// the credential headers adapters place (`x-api-key`,
-/// `x-goog-api-key`, `Authorization`) to an origin the host never
-/// validated. A provider that legitimately redirects answers 3xx, and
-/// the refusal surfaces through the adapter's own error path.
-fn upstream_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|error| Error::Request(format!("upstream transport: {error}")))
+/// Read the routes document the host supplied: it must be a JSON object
+/// — an array, scalar or `null` has no `routes` member and starting an
+/// empty gateway off one would hide the malformed file. No config at
+/// all stays the empty document: an unconfigured gateway still serves,
+/// it just binds no routes.
+fn config_document(config_text: Option<String>) -> Result<Value> {
+    match config_text {
+        Some(text) => {
+            let config: Value = serde_json::from_str(&text)
+                .map_err(|error| Error::Request(format!("config parse: {error}")))?;
+            if !config.is_object() {
+                return Err(Error::Request("config must be a JSON object".to_owned()));
+            }
+            Ok(config)
+        }
+        None => Ok(serde_json::json!({})),
+    }
 }
 
 async fn serve(args: &[String]) -> Result<()> {
@@ -176,18 +182,14 @@ async fn serve(args: &[String]) -> Result<()> {
                 .map_err(|error| Error::Request(format!("config {path}: {error}")))
         })
         .transpose()?;
-    let config: Value = match config_text {
-        Some(text) => serde_json::from_str(&text)
-            .map_err(|error| Error::Request(format!("config parse: {error}")))?,
-        None => Value::Null,
-    };
+    let config = config_document(config_text)?;
 
     let leases = Arc::new(Leases::disconnected());
     // Authorize first, then install: a handoff's credentials land already
     // divided into the scopes the document authorized.
     leases.authorize_scopes(&config)?;
     install_handoff_if_offered(&leases)?;
-    let transport = Arc::new(a4mp::ReqwestTransport::with_client(upstream_client()?));
+    let transport = fairliny_gateway::transport::upstream_transport()?;
     let mut router = Router::with_leases(transport, leases);
     router.load_routes(&config)?;
     let deadline = upstream_deadline(&config)?;
@@ -412,12 +414,12 @@ mod tests {
 
 #[cfg(test)]
 mod transport_tests {
-    use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn an_upstream_redirect_is_never_followed() {
+    /// One redirect-answering upstream: the 3xx is the whole answer and
+    /// the connection count proves nothing was followed.
+    fn redirect_server() -> (String, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listen");
         let url = format!("http://{}/v1/chat", listener.local_addr().expect("addr"));
         let server = std::thread::spawn(move || {
@@ -431,16 +433,50 @@ mod transport_tests {
                 )
                 .expect("respond");
         });
+        (url, server)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_upstream_redirect_is_never_followed() {
+        let (url, server) = redirect_server();
         // A redirect is answered, not followed: the 3xx surfaces as the
         // response and the credential headers never reach the redirect's
         // origin.
-        let response = upstream_client()
+        let response = fairliny_gateway::transport::upstream_client()
             .expect("client")
             .get(&url)
             .send()
             .await
             .expect("response");
         assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        server.join().expect("server");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_sdk_transport_stops_at_a_redirect_buffered_and_streaming() {
+        // Both Transport ports the SDK forwards through ride the same
+        // redirect-disabled client: a buffered `send` and a streaming
+        // `send_stream` each surface the 3xx rather than chasing it to
+        // an origin the route never declared.
+        let transport = fairliny_gateway::transport::upstream_transport().expect("transport");
+        let control = a4mp::RequestControl::default();
+
+        let (url, server) = redirect_server();
+        let request = a4mp::HttpRequest::get(url::Url::parse(&url).expect("url"));
+        let response = transport
+            .send(request, &control)
+            .await
+            .expect("buffered response");
+        assert_eq!(response.status, reqwest::StatusCode::FOUND);
+        server.join().expect("server");
+
+        let (url, server) = redirect_server();
+        let request = a4mp::HttpRequest::get(url::Url::parse(&url).expect("url"));
+        let response = transport
+            .send_stream(request, &control)
+            .await
+            .expect("streaming response");
+        assert_eq!(response.status, reqwest::StatusCode::FOUND);
         server.join().expect("server");
     }
 }

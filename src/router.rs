@@ -27,7 +27,7 @@ use a4mp::{
 use serde_json::Value;
 use url::Url;
 
-use crate::leases::{Leases, ProviderCredential};
+use crate::leases::{Leases, ProviderCredential, ScopeOwner};
 use crate::{Error, Result};
 
 /// The provider id endpoint routes bind under. An endpoint route names no
@@ -69,7 +69,9 @@ pub struct EndpointRoute {
     pub protocol: Protocol,
     /// The header the host expects the credential in. a4mp's adapter for
     /// `protocol` owns credential placement, so this is a declared
-    /// expectation checked against that placement, never a new one.
+    /// expectation checked against that placement, never a new one —
+    /// verifiable only over the built-in adapter factories, so a router
+    /// on a host-supplied catalog refuses it.
     pub auth_header: Option<String>,
     /// The mechanism the adapter asks the resolver for. An endpoint route
     /// can only name a leased mechanism — `none`, `api-key`, `bearer` —
@@ -302,13 +304,28 @@ pub struct Router {
     /// when the router's resolver is the crate's own custody port —
     /// [`Router::with_leases`] wires both from one `Arc`.
     leases: Option<Arc<Leases>>,
+    /// This router's ownership over its published scope bindings —
+    /// process-unique, so a second router sharing the same lease port
+    /// republishes only its own slice and can never erase the bindings
+    /// this router's live routes need.
+    scope_owner: ScopeOwner,
+    /// Whether the catalog's adapter factories are the built-ins this
+    /// router constructed itself — the only shape whose credential
+    /// placement a declared `authHeader` can be verified against. A
+    /// host-supplied catalog may register or override any protocol's
+    /// factory, so the declared header could pass the placement table
+    /// while the live adapter sends the credential somewhere else.
+    builtin_adapters: bool,
 }
 
 impl Router {
     /// A router over the catalog's built-in provider profiles and adapter
     /// factories: one shared transport, one credential resolver.
     pub fn new(transport: Arc<dyn Transport>, resolver: Arc<dyn CredentialResolver>) -> Self {
-        Self::with_catalog(a4mp::Catalog::with_builtin_adapters(), transport, resolver)
+        let mut router =
+            Self::with_catalog(a4mp::Catalog::with_builtin_adapters(), transport, resolver);
+        router.builtin_adapters = true;
+        router
     }
 
     /// A router over an explicit catalog — the shape a host uses when it
@@ -325,6 +342,8 @@ impl Router {
             scopes: BTreeMap::new(),
             prebound: BTreeMap::new(),
             leases: None,
+            scope_owner: ScopeOwner::new(),
+            builtin_adapters: false,
         }
     }
 
@@ -333,7 +352,10 @@ impl Router {
     /// it at declaration, so each authenticated surface resolves only
     /// the credentials the host authorized for its scope.
     pub fn with_leases(transport: Arc<dyn Transport>, leases: Arc<Leases>) -> Self {
-        Self::with_catalog_leases(a4mp::Catalog::with_builtin_adapters(), transport, leases)
+        let mut router =
+            Self::with_catalog_leases(a4mp::Catalog::with_builtin_adapters(), transport, leases);
+        router.builtin_adapters = true;
+        router
     }
 
     /// [`Self::with_leases`] over an explicit catalog.
@@ -417,6 +439,12 @@ impl Router {
                 reason: "model is already bound to an endpoint route".to_owned(),
             });
         }
+        if self.prebound.contains_key(&model) {
+            return Err(Error::Route {
+                model,
+                reason: "model is already bound to a host-registered adapter".to_owned(),
+            });
+        }
         let target = self.check_profile(&model, &route, &scope)?;
         self.commit(model, Declaration::Profile(route), target, scope)
     }
@@ -432,6 +460,12 @@ impl Router {
             return Err(Error::Route {
                 model,
                 reason: "model is already bound to a profile route".to_owned(),
+            });
+        }
+        if self.prebound.contains_key(&model) {
+            return Err(Error::Route {
+                model,
+                reason: "model is already bound to a host-registered adapter".to_owned(),
             });
         }
         let target = self.check_endpoint(&model, &route, &scope)?;
@@ -457,6 +491,22 @@ impl Router {
             reason,
         };
         check_credential_scope(&route.auth, scope).map_err(refuse)?;
+        // A mechanism the resolver can never answer binds fine at
+        // startup and then fails every forward — on the lease port that
+        // is everything outside the leased kinds, so it refuses here
+        // rather than projecting a dead model. A host-supplied resolver
+        // owns its custody and keeps the full mechanism vocabulary.
+        if self.leases.is_some()
+            && !matches!(route.auth, AuthKind::None)
+            && ProviderCredential::for_auth(&route.auth).is_none()
+        {
+            return Err(refuse(format!(
+                "profile auth {} is not leased: the lease port answers \
+                 api-key and bearer — cloud identity and external access \
+                 need a host-supplied resolver",
+                auth_label(&route.auth)
+            )));
+        }
         let profile = self
             .client
             .catalog()
@@ -468,6 +518,30 @@ impl Router {
                 profile.id,
                 auth_label(&route.auth)
             )));
+        }
+        // A declared protocol must be one the profile serves in the
+        // declared region: the catalog's target selection falls back to
+        // the profile's first target on a miss, so a mismatch would bind
+        // one protocol while `models.list` reports the declared label.
+        // The refusal lands here, before the route and its scope publish.
+        if let Some(protocol) = &route.protocol {
+            let served = profile
+                .targets
+                .iter()
+                .filter(|def| route.region.is_none() || def.region == route.region.as_deref())
+                .any(|def| def.protocol == *protocol);
+            if !served {
+                return Err(refuse(format!(
+                    "profile {} serves no {} target{}",
+                    profile.id,
+                    protocol_label(protocol),
+                    route
+                        .region
+                        .as_deref()
+                        .map(|region| format!(" in {region}"))
+                        .unwrap_or_default()
+                )));
+            }
         }
         let adapter = self.bind_profile(route).map_err(refuse)?;
         self.check_scope_resolver(scope).map_err(refuse)?;
@@ -498,6 +572,20 @@ impl Router {
         }
         check_base_url(&route.base_url).map_err(refuse)?;
         if let Some(header) = &route.auth_header {
+            // The placement table describes the built-in adapter
+            // factories only. A host-supplied catalog may register or
+            // override any protocol's factory, so a header the table
+            // accepts could still land the credential somewhere else —
+            // unverifiable placement refuses rather than trusting it.
+            if !self.builtin_adapters {
+                return Err(refuse(format!(
+                    "authHeader {header:?} cannot be verified: a custom \
+                     catalog's adapter for {} owns credential placement — \
+                     the declaration stands only over the built-in \
+                     adapter factories",
+                    protocol_label(&route.protocol)
+                )));
+            }
             check_auth_header(&route.protocol, &route.auth, header).map_err(refuse)?;
         }
         let adapter = self.bind_endpoint(route).map_err(refuse)?;
@@ -566,11 +654,13 @@ impl Router {
         Ok(())
     }
 
-    /// Republish every live scope binding to the lease port in one swap.
-    /// The declared set is the whole table, so a route that stopped
-    /// declaring a scope releases its old binding, a route rebound to
-    /// another surface frees the original target, and a surface two
-    /// routes share keeps the binding both still need.
+    /// Republish every live scope binding to the lease port in one swap,
+    /// under this router's own binding owner. The declared set is the
+    /// whole table, so a route that stopped declaring a scope releases
+    /// its old binding, a route rebound to another surface frees the
+    /// original target, and a surface two routes share keeps the binding
+    /// both still need — all without touching the slice a sibling router
+    /// over the same lease port published.
     fn publish_scopes(
         &self,
         scopes: &BTreeMap<String, ScopedBinding>,
@@ -580,6 +670,7 @@ impl Router {
         };
         leases
             .replace_target_scopes(
+                self.scope_owner,
                 scopes
                     .values()
                     .map(|binding| (&binding.target, binding.scope.as_str())),
@@ -589,11 +680,18 @@ impl Router {
 
     /// Load a routes document `{"routes":[{model,provider|endpoint,...,
     /// credentialScope?}]}` — plus the `credentialScopes` authorization
-    /// table the scopes name, which the lease port reads. A `routes`
-    /// member must be an array when present, and the whole document is
+    /// table the scopes name, which the lease port reads. The document
+    /// must be a JSON object — an array, scalar or `null` has no `routes`
+    /// member and refusing it is the only honest answer — and a `routes`
+    /// member must be an array when present. The whole document is
     /// parsed and checked before anything commits: a malformed entry
     /// refuses the table — the gateway never silently runs half of it.
     pub fn load_routes(&mut self, document: &Value) -> Result<()> {
+        if !document.is_object() {
+            return Err(Error::Request(
+                "routes document must be a JSON object".to_owned(),
+            ));
+        }
         let entries = match document.get("routes") {
             None => return Ok(()),
             Some(routes) => routes.as_array().ok_or_else(|| invalid("routes"))?,
@@ -648,6 +746,9 @@ impl Router {
                 Declaration::Endpoint(_) if routes.contains_key(&model) => {
                     Some("model is already bound to a profile route")
                 }
+                _ if self.prebound.contains_key(&model) => {
+                    Some("model is already bound to a host-registered adapter")
+                }
                 _ => None,
             };
             if let Some(reason) = collision {
@@ -688,15 +789,28 @@ impl Router {
     }
 
     /// Register an adapter the host bound itself under an outward name.
-    /// The host owns the binding — no profile check applies.
+    /// The host owns the binding — no profile check applies — but the
+    /// name must still be free: a prebound adapter resolves ahead of
+    /// the declared routes, so one registered over a declared model
+    /// would advertise both in `models.list` while every forward
+    /// bypassed the declared scope. The collision refuses here and at
+    /// route declaration; it never silently splits the two.
     pub fn register_adapter(
         &mut self,
         model: impl Into<String>,
         upstream_model: impl Into<String>,
         adapter: Arc<dyn Adapter>,
-    ) {
+    ) -> Result<()> {
+        let model = model.into();
+        if self.routes.contains_key(&model) || self.endpoint_routes.contains_key(&model) {
+            return Err(Error::Route {
+                model,
+                reason: "model is already bound to a declared route".to_owned(),
+            });
+        }
         self.prebound
-            .insert(model.into(), (adapter, upstream_model.into()));
+            .insert(model, (adapter, upstream_model.into()));
+        Ok(())
     }
 
     /// The declared profile routes, for read-only projections.
@@ -1317,6 +1431,78 @@ mod tests {
     }
 
     #[test]
+    fn a_profile_route_refuses_mechanisms_the_lease_port_cannot_answer() {
+        // Bedrock's catalog profile accepts cloud identity, and the
+        // route binds — but the sidecar's resolver is always the lease
+        // port, which answers only api-key and bearer, so the model
+        // would list and then fail every forward. The refusal lands at
+        // declaration, while a host-supplied resolver keeps the whole
+        // mechanism vocabulary: the host owns that custody itself.
+        for auth in ["cloud:aws", "external:acme.sso", "other:acme"] {
+            let error = declare(serde_json::json!({
+                "model": "m", "provider": "bedrock", "auth": auth
+            }))
+            .expect_err(auth);
+            assert!(error.to_string().contains("not leased"), "{auth}: {error}");
+        }
+
+        let mut host_router = Router::new(
+            Arc::new(a4mp::ReqwestTransport::new()),
+            Arc::new(a4mp::NoCredentials),
+        );
+        host_router
+            .load_routes(&serde_json::json!({"routes": [
+                {"model": "m", "provider": "bedrock", "auth": "cloud:aws"}
+            ]}))
+            .expect("host resolver answers cloud identity");
+        assert!(host_router.resolve("m").is_ok());
+
+        // `none` and the leased kinds still declare on the lease port.
+        declare(serde_json::json!({
+            "model": "m", "provider": "ollama", "auth": "none",
+            "protocol": "other:ollama",
+            "vars": {"endpoint": "http://localhost:11434"}
+        }))
+        .expect("none binds");
+    }
+
+    #[test]
+    fn a_declared_protocol_must_be_one_the_profile_serves() {
+        // OpenAI's profile serves openai-responses and
+        // openai-chat-completions. A route pinned to anthropic-messages
+        // would silently bind the profile's first target — the catalog
+        // falls back on a protocol miss — while `models.list` reports
+        // the declared label, so the mismatch refuses at declaration.
+        let error = declare(scoped_entry(serde_json::json!({
+            "model": "m", "provider": "openai",
+            "protocol": "anthropic-messages", "auth": "api-key"
+        })))
+        .expect_err("a protocol the profile does not serve refuses");
+        assert!(error.to_string().contains("anthropic-messages"), "{error}");
+
+        // The profile's own protocols bind, declared or defaulted.
+        for protocol in ["openai-responses", "openai-chat-completions"] {
+            declare(scoped_entry(serde_json::json!({
+                "model": "m", "provider": "openai",
+                "protocol": protocol, "auth": "api-key"
+            })))
+            .unwrap_or_else(|error| panic!("{protocol}: {error}"));
+        }
+        declare(scoped_entry(serde_json::json!({
+            "model": "m", "provider": "openai", "auth": "api-key"
+        })))
+        .expect("the primary target binds by default");
+
+        // And a matching regional plan is not refused by the check.
+        declare(serde_json::json!({
+            "model": "m", "provider": "ollama", "auth": "none",
+            "protocol": "other:ollama",
+            "vars": {"endpoint": "http://localhost:11434"}
+        }))
+        .expect("the provider-native protocol binds");
+    }
+
+    #[test]
     fn an_endpoint_refuses_unknown_protocols_and_bad_urls() {
         let entry = |url: &str, protocol: &str| serde_json::json!({"model": "m", "endpoint": {"baseUrl": url, "protocol": protocol}});
         // An unnamed label fails parsing; an `other:` protocol with no
@@ -1387,6 +1573,41 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn an_auth_header_is_unverifiable_over_a_custom_catalog() {
+        // A host-supplied catalog may register or override any
+        // protocol's adapter factory — even one that works. The
+        // built-in placement table no longer describes where the
+        // credential lands, so a declared authHeader refuses before
+        // binding rather than validating against the wrong adapter.
+        let mut catalog = a4mp::Catalog::new(Vec::new()).expect("catalog");
+        catalog.register_adapter(
+            Protocol::OpenAiChatCompletions,
+            Arc::new(|target, auth, transport, resolver, _effects| {
+                a4mp::Client::new(a4mp::Catalog::with_builtin_adapters(), transport, resolver)
+                    .bind_target(target, auth)
+            }),
+        );
+        let leases = Arc::new(Leases::disconnected());
+        leases
+            .authorize_scope("vendor-scope", [uuid::Uuid::new_v4().to_string()])
+            .expect("authorize");
+        let mut router =
+            Router::with_catalog_leases(catalog, Arc::new(a4mp::ReqwestTransport::new()), leases);
+        let error = router
+            .load_routes(&serde_json::json!({ "routes": [
+                scoped_entry(serde_json::json!({
+                    "model": "m",
+                    "endpoint": {"baseUrl": "https://api.vendor.example", "protocol": "openai-chat-completions"},
+                    "auth": "api-key",
+                    "authHeader": "authorization"
+                }))
+            ]}))
+            .expect_err("authHeader over a custom catalog refuses");
+        assert!(error.to_string().contains("cannot be verified"), "{error}");
+        assert!(router.resolve("m").is_err());
     }
 
     #[test]

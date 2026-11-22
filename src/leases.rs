@@ -14,7 +14,9 @@
 //! authenticated route's bound surface against the scope it declared. A
 //! surface then resolves only the credentials its host authorized for it;
 //! a scope holding none fails closed rather than borrowing another
-//! vendor's key.
+//! vendor's key. Routers sharing this port publish their bindings under
+//! their own [`ScopeOwner`] — one router's whole-table publish retires
+//! only its own slice, never another router's live bindings.
 //!
 //! Secret bytes never leave this module except through a4mp's redacted
 //! `Secret`/`Credential` boundary types. Errors carry the lease contract's
@@ -25,6 +27,7 @@ use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::fmt;
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
@@ -142,6 +145,47 @@ impl LeaseEpochSource for StaticEpoch {
     }
 }
 
+/// An epoch source that stops answering at a fixed instant. Every scoped
+/// slot is minted against the install's own expiry, so a scope authorized
+/// late materializes a lease that still dies at the deadline the install
+/// fixed — past it the epoch read reports no active epoch and the lease
+/// contract's revocation check fails the very next resolution, whatever
+/// duration the minted document happened to carry.
+struct DeadlineEpoch {
+    inner: Arc<dyn LeaseEpochSource>,
+    deadline: Instant,
+}
+
+impl LeaseEpochSource for DeadlineEpoch {
+    fn active_epoch(&self) -> anyhow::Result<Option<String>> {
+        if Instant::now() >= self.deadline {
+            return Ok(None);
+        }
+        self.inner.active_epoch()
+    }
+}
+
+/// One scope-binding owner's identity. Every router publishing surface
+/// bindings holds a fresh owner, so its whole-table publish replaces only
+/// its own slice — a second router over the same lease port can never
+/// erase the bindings a still-live route elsewhere needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ScopeOwner(u64);
+
+impl ScopeOwner {
+    /// A process-unique owner identity.
+    pub fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl Default for ScopeOwner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Everything one installed handoff produced — the lease state that
 /// installs, replacements and lock-down swap as a single consistent
 /// piece, so a resolution never observes a new document beside an old
@@ -187,9 +231,14 @@ pub struct Leases {
     state: Mutex<LeaseState>,
     /// Scope name → the credential ids the host authorized for it.
     authorizations: Mutex<BTreeMap<String, BTreeSet<String>>>,
-    /// Bound surface key → scope name. The router publishes each scoped
-    /// route's surface at declaration; resolution dispatches on it.
-    target_scopes: Mutex<BTreeMap<String, String>>,
+    /// Binding owner → (bound surface key → the scope it serves, or a
+    /// retired marker). Each router publishes its scoped routes'
+    /// surfaces under its own [`ScopeOwner`], so its publish retires its
+    /// slice and nothing else; a surface an owner's republish drops keeps
+    /// a tombstone, so an adapter detached by that republish fails closed
+    /// rather than slipping back to the unscoped slot. Resolution
+    /// dispatches on the live bindings every owner's table names.
+    target_scopes: Mutex<BTreeMap<ScopeOwner, BTreeMap<String, Option<String>>>>,
 }
 
 impl Leases {
@@ -270,6 +319,9 @@ impl Leases {
     /// cannot re-materialize until the next document install.
     pub fn install_lease(&self, lease: CredentialLease<ProviderCredential>) {
         let mut state = LeaseState::disconnected();
+        state.expires_at = Instant::now()
+            .checked_add(lease.lease_duration())
+            .unwrap_or_else(Instant::now);
         state.unscoped = CredentialSlot::new(lease);
         *lock(&self.state) = state;
     }
@@ -308,7 +360,7 @@ impl Leases {
         for (scope, ids) in lock(&self.authorizations).iter() {
             scoped.insert(
                 scope.clone(),
-                scoped_slot(document, ids, duration, epoch_source.clone())?,
+                scoped_slot(document, ids, expires_at, epoch_source.clone())?,
             );
         }
         Ok(LeaseState {
@@ -334,42 +386,66 @@ impl Leases {
         scope: &str,
         credential_ids: impl IntoIterator<Item = impl AsRef<str>>,
     ) -> Result<()> {
-        let invalid = || Error::Credential("credential_scope_invalid".to_owned());
-        if scope.is_empty() || scope.len() > MAX_SCOPE_NAME_BYTES {
-            return Err(invalid());
+        let ids = validate_scope(scope, credential_ids)?;
+        self.commit_authorizations([(scope.to_owned(), ids)])
+    }
+
+    /// Publish a fully validated authorization table in one commit: every
+    /// scope's slot materializes under the single state lock first — a
+    /// minting failure anywhere aborts before anything lands — then the
+    /// recorded ids and their slots publish together, so a rejected table
+    /// can never leave a prefix of its entries changing which credentials
+    /// live routes resolve.
+    fn commit_authorizations(
+        &self,
+        table: impl IntoIterator<Item = (String, BTreeSet<String>)>,
+    ) -> Result<()> {
+        let table: Vec<_> = table.into_iter().collect();
+        let mut state = lock(&self.state);
+        let mut slots = BTreeMap::new();
+        if let (Some(document), Some(epoch_source)) = (&state.document, &state.epoch_source) {
+            for (scope, ids) in &table {
+                slots.insert(
+                    scope.clone(),
+                    scoped_slot(document, ids, state.expires_at, epoch_source.clone())?,
+                );
+            }
         }
-        let ids: BTreeSet<String> = credential_ids
-            .into_iter()
-            .map(|id| {
-                let id = id.as_ref();
-                uuid::Uuid::parse_str(id)
-                    .ok()
-                    .filter(|parsed| parsed.to_string() == id)
-                    .map(|_| id.to_owned())
-                    .ok_or_else(invalid)
-            })
-            .collect::<Result<_>>()?;
-        if ids.is_empty() {
-            return Err(invalid());
+        let mut authorizations = lock(&self.authorizations);
+        for (scope, ids) in table {
+            authorizations.insert(scope.clone(), ids);
+            if let Some(slot) = slots.remove(&scope) {
+                state.scoped.insert(scope, slot);
+            }
         }
-        lock(&self.authorizations).insert(scope.to_owned(), ids.clone());
-        self.materialize_scope(scope, &ids)
+        Ok(())
     }
 
     /// The `credentialScopes` member of a routes document:
     /// `{"credentialScopes": {"<scope>": ["<credentialId>", ...]}}` —
     /// the host-authorized table every route's `credentialScope` names.
-    /// An absent member authorizes nothing; a malformed one refuses.
+    /// An absent member authorizes nothing; a malformed one refuses —
+    /// and a document that is not a JSON object is malformed, never an
+    /// empty table. The whole table validates and stages before any of
+    /// it publishes, so a malformed later entry cannot leave earlier
+    /// entries already changing which credentials live routes resolve.
     pub fn authorize_scopes(&self, document: &serde_json::Value) -> Result<()> {
+        if !document.is_object() {
+            return Err(Error::Credential("credential_scope_invalid".to_owned()));
+        }
         let Some(scopes) = document.get("credentialScopes") else {
             return Ok(());
         };
         let invalid = || Error::Credential("credential_scope_invalid".to_owned());
+        let mut table = Vec::new();
         for (scope, ids) in scopes.as_object().ok_or_else(invalid)? {
             let ids = ids.as_array().ok_or_else(invalid)?;
-            self.authorize_scope(scope, ids.iter().map(|id| id.as_str().unwrap_or("")))?;
+            table.push((
+                scope.clone(),
+                validate_scope(scope, ids.iter().map(|id| id.as_str().unwrap_or("")))?,
+            ));
         }
-        Ok(())
+        self.commit_authorizations(table)
     }
 
     /// Whether `scope` is one the host authorized — the read-only check
@@ -380,15 +456,24 @@ impl Leases {
         lock(&self.authorizations).contains_key(scope)
     }
 
-    /// Publish the whole bound-surface table in one swap: every live
-    /// scoped route's surface → the scope it declared. The table is
-    /// validated before it lands — a scope the host did not authorize,
-    /// or two surfaces pointing at different scopes for one key, refuses
-    /// the whole publish — and the swap is total, so a route that
-    /// stopped declaring a scope releases its old binding instead of
-    /// leaving it behind for the next surface that reuses the target.
+    /// Publish the whole bound-surface table for `owner` in one swap:
+    /// every live scoped route's surface → the scope it declared. The
+    /// table is validated before it lands — a scope the host did not
+    /// authorize, or two surfaces pointing at different scopes for one
+    /// key, refuses the whole publish — and the swap covers only the
+    /// owner's own slice, so a route that stopped declaring a scope
+    /// retires its old binding while a binding another router still
+    /// needs is never touched. A retired binding keeps a tombstone
+    /// rather than disappearing: an adapter detached by the republish
+    /// — already bound against the retired surface — fails closed on
+    /// its next resolve instead of falling back to the unscoped slot,
+    /// until a live binding reclaims the surface. A surface another
+    /// owner already bound to a different scope refuses the whole
+    /// publish too: resolution could never tell the two declarations
+    /// apart, so the conflict dies at declaration.
     pub fn replace_target_scopes<'a>(
         &self,
+        owner: ScopeOwner,
         bindings: impl IntoIterator<Item = (&'a ServiceTarget, &'a str)>,
     ) -> Result<()> {
         let mut table = BTreeMap::new();
@@ -412,50 +497,78 @@ impl Leases {
                 }
             }
         }
-        *lock(&self.target_scopes) = table;
-        Ok(())
-    }
-
-    /// Rebuild one scope's slot inside the published state, minting only
-    /// the duration the installed lease has left — the expiry fixed at
-    /// install is never extended, so re-authorizing cannot restore
-    /// access past it. A scope the document carries no credential for
-    /// installs an empty lease — every resolution fails closed instead
-    /// of falling back to the unscoped slot. No-op until a handoff and
-    /// its epoch source have both been installed.
-    fn materialize_scope(&self, scope: &str, ids: &BTreeSet<String>) -> Result<()> {
-        let mut state = lock(&self.state);
-        let (Some(document), Some(epoch_source)) =
-            (state.document.clone(), state.epoch_source.clone())
-        else {
-            return Ok(());
-        };
-        let remaining = state.expires_at.saturating_duration_since(Instant::now());
-        state.scoped.insert(
-            scope.to_owned(),
-            scoped_slot(&document, ids, remaining, epoch_source)?,
-        );
+        let mut live = lock(&self.target_scopes);
+        for (key, scope) in &table {
+            if live.iter().any(|(other, existing)| {
+                *other != owner
+                    && existing
+                        .get(key)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|bound| bound != scope)
+            }) {
+                return Err(Error::Credential("credential_scope_conflict".to_owned()));
+            }
+        }
+        let slice = live.entry(owner).or_default();
+        for bound in slice.values_mut() {
+            *bound = None;
+        }
+        slice.extend(table.into_iter().map(|(key, scope)| (key, Some(scope))));
         Ok(())
     }
 }
 
+/// The pure half of authorization — name and id validation with no
+/// state touched — so [`Leases::authorize_scopes`] can stage a whole
+/// table before publishing any of it.
+fn validate_scope(
+    scope: &str,
+    credential_ids: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Result<BTreeSet<String>> {
+    let invalid = || Error::Credential("credential_scope_invalid".to_owned());
+    if scope.is_empty() || scope.len() > MAX_SCOPE_NAME_BYTES {
+        return Err(invalid());
+    }
+    let ids: BTreeSet<String> = credential_ids
+        .into_iter()
+        .map(|id| {
+            let id = id.as_ref();
+            uuid::Uuid::parse_str(id)
+                .ok()
+                .filter(|parsed| parsed.to_string() == id)
+                .map(|_| id.to_owned())
+                .ok_or_else(invalid)
+        })
+        .collect::<Result<_>>()?;
+    if ids.is_empty() {
+        return Err(invalid());
+    }
+    Ok(ids)
+}
+
 /// Build one scope's slot from a retained document: its authorized ids
-/// and nothing else, under the same epoch source, living at most
-/// `duration` — the install's remaining lifetime when a scope
-/// materializes late. Below the contract's one-second minimum no lease
-/// can mint: the install's own expiry has effectively arrived, so the
-/// scope stays disconnected and resolves unavailable.
+/// and nothing else, under the install's epoch source wrapped in
+/// [`DeadlineEpoch`] so the minted lease dies at `deadline` — the
+/// install's own expiry — however much duration the document itself
+/// still claims. Below the contract's one-second minimum no lease can
+/// mint: the install's expiry has effectively arrived, so the scope
+/// stays disconnected and resolves unavailable.
 fn scoped_slot(
     document: &[u8],
     ids: &BTreeSet<String>,
-    duration: std::time::Duration,
+    deadline: Instant,
     epoch_source: Arc<dyn LeaseEpochSource>,
 ) -> Result<CredentialSlot<ProviderCredential>> {
     let slot = CredentialSlot::disconnected();
-    if duration.as_secs() >= 1 {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.as_secs() >= 1 {
         let mut handoff = CredentialHandoff::<ProviderCredential>::from_json(document)
             .map_err(|error| Error::Credential(error.to_string()))?;
         handoff.retain_credential_ids(ids);
+        let epoch_source: Arc<dyn LeaseEpochSource> = Arc::new(DeadlineEpoch {
+            inner: epoch_source,
+            deadline,
+        });
         slot.install_handoff(handoff, epoch_source)
             .map_err(|error| Error::Credential(error.to_string()))?;
     }
@@ -496,8 +609,14 @@ impl CredentialResolver for Leases {
     ///
     /// A surface the router registered against a credential scope
     /// resolves only from that scope's slot — the credentials the host
-    /// authorized for it — and fails closed when the scope holds none.
-    /// Unregistered surfaces answer from the unscoped slot.
+    /// authorized for it — and fails closed when the scope holds none,
+    /// when two owners bound the surface to different scopes, or when
+    /// every binding for it retired: an adapter detached by a republish
+    /// never slips back to the unscoped slot its scope once guarded it
+    /// from. Never-bound surfaces answer from the unscoped slot. One absolute
+    /// expiry covers every slot the install produced: past the install's
+    /// deadline the answer is `credential_lease_expired`, so a scope
+    /// materialized late can never outlive the handoff it came from.
     async fn resolve(
         &self,
         scope: CredentialScope<'_>,
@@ -511,10 +630,41 @@ impl CredentialResolver for Leases {
                 "credential_lease_kind_not_leased".to_owned(),
             ));
         };
-        let scoped = lock(&self.target_scopes)
-            .get(&target_key(scope.target))
-            .cloned();
+        let scoped = {
+            let tables = lock(&self.target_scopes);
+            let key = target_key(scope.target);
+            let mut found = BTreeSet::new();
+            let mut retired = false;
+            for table in tables.values() {
+                match table.get(&key) {
+                    Some(Some(scope)) => {
+                        found.insert(scope.clone());
+                    }
+                    Some(None) => retired = true,
+                    None => {}
+                }
+            }
+            match found.len() {
+                0 if retired => {
+                    return Err(a4mp::Error::Credential(
+                        "credential_scope_retired".to_owned(),
+                    ));
+                }
+                0 => None,
+                1 => found.pop_first(),
+                _ => {
+                    return Err(a4mp::Error::Credential(
+                        "credential_scope_conflict".to_owned(),
+                    ));
+                }
+            }
+        };
         let state = lock(&self.state);
+        if state.epoch_source.is_some() && Instant::now() >= state.expires_at {
+            return Err(a4mp::Error::Credential(
+                "credential_lease_expired".to_owned(),
+            ));
+        }
         let secret = match scoped {
             Some(name) => match state.scoped.get(&name) {
                 Some(slot) => slot.resolve(kind).map_err(|e| invalid(&e))?,

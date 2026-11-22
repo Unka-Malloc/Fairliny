@@ -24,10 +24,12 @@ let leases = Arc::new(Leases::disconnected());          // resolves fail closed 
 let document = Leases::read_handoff(channel)?;          // bounded, zeroizing buffer
 leases.authorize_scope("openai-key", ["<credentialId>"])?;  // host-authorized scopes
 leases.install_handoff(&document, epoch_source)?;       // FileEpochSource: custody-driven revocation
+let transport = fairliny_gateway::transport::upstream_transport()?;  // never follows redirects
 let mut router = Router::with_leases(transport, leases);  // registers scoped surfaces
 router.add_route("local", route)?;                      // Route: profile routes, `none` auth
-router.add_route_scoped("chat", route, "openai-key")?;    // api-key/bearer requires a scope
+router.add_route_scoped("chat", scoped_route, "openai-key")?;  // api-key/bearer requires a scope
 router.add_endpoint_route("vendor", endpoint_route)?;   // EndpointRoute: explicit baseUrl
+router.add_endpoint_route_scoped("vendor-chat", scoped_endpoint, "openai-key")?;  // authenticated endpoints scope too
 // or register_adapter / with_catalog_leases
 let meter = Meter::open(state_root)?;                   // compose(root, binding) | unmetered()
 let service = Service::new(router, meter);

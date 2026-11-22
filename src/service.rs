@@ -886,17 +886,19 @@ mod tests {
         let resolver: Arc<dyn a4mp::CredentialResolver> =
             Arc::new(crate::leases::Leases::disconnected());
         let mut router = Router::new(Arc::new(a4mp::ReqwestTransport::new()), resolver);
-        router.register_adapter(
-            "ping-model",
-            "upstream-ping",
-            Arc::new(EchoAdapter {
-                target: a4mp::ServiceTarget::new(
-                    "stub",
-                    a4mp::Protocol::Other("stub".to_owned()),
-                    url::Url::parse("https://stub.invalid/").expect("url"),
-                ),
-            }),
-        );
+        router
+            .register_adapter(
+                "ping-model",
+                "upstream-ping",
+                Arc::new(EchoAdapter {
+                    target: a4mp::ServiceTarget::new(
+                        "stub",
+                        a4mp::Protocol::Other("stub".to_owned()),
+                        url::Url::parse("https://stub.invalid/").expect("url"),
+                    ),
+                }),
+            )
+            .expect("register adapter");
         let service = Service::new(router, Meter::unmetered());
         poison(&service.forward);
         poison(&service.settle);

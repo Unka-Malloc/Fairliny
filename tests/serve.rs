@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use credential_lease::{CredentialHandoff, LeaseEpochSource, LeasedCredential, SecretBytes};
-use fairliny_gateway::leases::{Leases, ProviderCredential};
+use fairliny_gateway::leases::{Leases, ProviderCredential, ScopeOwner};
 use fairliny_gateway::meter::Meter;
 use fairliny_gateway::router::{EndpointRoute, Route, Router};
 use fairliny_gateway::service::Service;
@@ -165,7 +165,9 @@ fn test_router_with(
 ) -> Router {
     let transport = Arc::new(a4mp::ReqwestTransport::new());
     let mut router = Router::new(transport, resolver);
-    router.register_adapter("ping-model", "upstream-ping", adapter);
+    router
+        .register_adapter("ping-model", "upstream-ping", adapter)
+        .expect("register adapter");
     router
 }
 
@@ -720,17 +722,19 @@ async fn a_hung_upstream_errors_on_the_deadline_and_the_loop_recovers() {
         Arc::new(a4mp::ReqwestTransport::new()),
         Arc::new(Leases::disconnected()),
     );
-    router.register_adapter(
-        "hang-model",
-        "upstream-hang",
-        Arc::new(HungAdapter {
-            target: a4mp::ServiceTarget::new(
-                "stub",
-                a4mp::Protocol::Other("stub".to_owned()),
-                url::Url::parse("https://stub.invalid/").expect("url"),
-            ),
-        }),
-    );
+    router
+        .register_adapter(
+            "hang-model",
+            "upstream-hang",
+            Arc::new(HungAdapter {
+                target: a4mp::ServiceTarget::new(
+                    "stub",
+                    a4mp::Protocol::Other("stub".to_owned()),
+                    url::Url::parse("https://stub.invalid/").expect("url"),
+                ),
+            }),
+        )
+        .expect("register adapter");
     let service = Service::new(router, Meter::unmetered())
         .with_upstream_deadline(Some(Duration::from_millis(50)));
 
@@ -1869,7 +1873,7 @@ async fn clearing_or_replacing_the_lease_reaches_every_scoped_surface() {
         .expect("install");
     let target = scoped_target();
     leases
-        .replace_target_scopes([(&target, "vendor-scope")])
+        .replace_target_scopes(ScopeOwner::new(), [(&target, "vendor-scope")])
         .expect("bind");
     resolve_for_target(&leases, &target)
         .await
@@ -1955,13 +1959,13 @@ async fn authorizing_a_scope_late_never_extends_the_installed_expiry() {
         .expect("authorize");
     let target = scoped_target();
     leases
-        .replace_target_scopes([(&target, "vendor-scope")])
+        .replace_target_scopes(ScopeOwner::new(), [(&target, "vendor-scope")])
         .expect("bind");
     let error = resolve_for_target(&leases, &target)
         .await
         .expect_err("no restarted lease");
     assert!(
-        error.to_string().contains("credential_lease_unavailable"),
+        error.to_string().contains("credential_lease_expired"),
         "{error}"
     );
     let error = resolve_unscoped(&leases)
@@ -1997,7 +2001,7 @@ async fn a_reinstalled_handoff_replaces_the_whole_lease_state() {
         .expect("install a");
     let target = scoped_target();
     leases
-        .replace_target_scopes([(&target, "vendor-scope")])
+        .replace_target_scopes(ScopeOwner::new(), [(&target, "vendor-scope")])
         .expect("bind");
     match resolve_for_target(&leases, &target)
         .await
@@ -2033,6 +2037,17 @@ fn a_routes_member_must_be_an_array_and_the_whole_table_must_validate() {
         Arc::new(a4mp::ReqwestTransport::new()),
         Arc::new(Leases::disconnected()),
     );
+    // A document that is not a JSON object refuses — an array, scalar
+    // or `null` has no `routes` member and can never masquerade as an
+    // empty route table.
+    for document in [
+        serde_json::json!([]),
+        serde_json::json!(5),
+        serde_json::json!("routes"),
+        serde_json::Value::Null,
+    ] {
+        assert!(router.load_routes(&document).is_err(), "{document}");
+    }
     // A present `routes` member that is not an array refuses — it can
     // never masquerade as an empty route table.
     for document in [
@@ -2101,4 +2116,346 @@ fn replacing_a_route_releases_its_scope_binding() {
         .add_endpoint_route_scoped("m2", endpoint(), "scope-a")
         .expect("the freed surface binds a new scope");
     assert_eq!(router.credential_scope("m2"), Some("scope-a"));
+}
+
+#[tokio::test]
+async fn a_late_scoped_slot_dies_at_the_install_deadline() {
+    // The scope materializes mid-lease: the document's own duration
+    // would let its slot outlive the install's expiry, but one absolute
+    // deadline covers every slot the install produced — the minted slot
+    // resolves before it and refuses after it.
+    let epoch = Arc::new(Epochs {
+        current: Mutex::new(uuid::Uuid::new_v4().to_string()),
+    });
+    let epoch_id = epoch.current.lock().unwrap().clone();
+    let id = uuid::Uuid::new_v4().to_string();
+    let leases = Leases::disconnected();
+    leases
+        .install_handoff(
+            &handoff_document_for(&epoch_id, &[(&id, b"vendor-key")], 3),
+            epoch,
+        )
+        .expect("install");
+    // Authorized while well over a second remains, the slot mints and
+    // resolves — the remaining lifetime gates creation, not use.
+    std::thread::sleep(Duration::from_millis(1200));
+    leases
+        .authorize_scope("vendor-scope", [&id])
+        .expect("authorize");
+    let target = scoped_target();
+    leases
+        .replace_target_scopes(ScopeOwner::new(), [(&target, "vendor-scope")])
+        .expect("bind");
+    match resolve_for_target(&leases, &target)
+        .await
+        .expect("scoped resolves inside the lease")
+    {
+        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), "vendor-key"),
+        other => panic!("expected an api-key credential: {other:?}"),
+    }
+    // Past the install's deadline the slot must not answer — the
+    // document's 3-second duration would otherwise keep it alive a full
+    // second longer.
+    std::thread::sleep(Duration::from_millis(2200));
+    let error = resolve_for_target(&leases, &target)
+        .await
+        .expect_err("the install's expiry covers scoped slots");
+    assert!(error.to_string().contains("credential_lease_"), "{error}");
+}
+
+#[tokio::test]
+async fn reauthorizing_a_scope_commits_the_new_ids_with_their_slot() {
+    // The authorized id set and the materialized slot land as one
+    // commit: re-authorizing the scope swaps both together, so the next
+    // resolution answers only the latest authorized credential — never
+    // a recorded set beside an outdated slot.
+    let epoch = Arc::new(Epochs {
+        current: Mutex::new(uuid::Uuid::new_v4().to_string()),
+    });
+    let epoch_id = epoch.current.lock().unwrap().clone();
+    let id_a = uuid::Uuid::new_v4().to_string();
+    let id_b = uuid::Uuid::new_v4().to_string();
+    let leases = Leases::disconnected();
+    leases
+        .install_handoff(
+            &handoff_document(&epoch_id, &[(&id_a, b"key-a"), (&id_b, b"key-b")]),
+            epoch,
+        )
+        .expect("install");
+    leases
+        .authorize_scope("vendor-scope", [&id_a])
+        .expect("authorize");
+    let target = scoped_target();
+    leases
+        .replace_target_scopes(ScopeOwner::new(), [(&target, "vendor-scope")])
+        .expect("bind");
+    for (id, secret) in [(&id_a, "key-a"), (&id_b, "key-b"), (&id_a, "key-a")] {
+        leases
+            .authorize_scope("vendor-scope", [id])
+            .expect("authorize");
+        match resolve_for_target(&leases, &target)
+            .await
+            .expect("scoped resolve")
+        {
+            a4mp::Credential::ApiKey(resolved) => assert_eq!(resolved.expose(), secret),
+            other => panic!("expected an api-key credential: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_sibling_routers_publish_never_erases_the_live_bindings() {
+    // Two routers share one lease port. Router A's scoped route binds a
+    // scope the handoff does not carry, so its surface must keep failing
+    // closed; a whole-table publish from router B — even one carrying no
+    // scoped bindings at all — retiring it would drop the surface back
+    // to the unscoped pool, which resolves.
+    let epoch = Arc::new(Epochs {
+        current: Mutex::new(uuid::Uuid::new_v4().to_string()),
+    });
+    let epoch_id = epoch.current.lock().unwrap().clone();
+    let id = uuid::Uuid::new_v4().to_string();
+    let ghost = uuid::Uuid::new_v4().to_string();
+    let leases = Arc::new(Leases::disconnected());
+    leases
+        .authorize_scope("ghost-scope", [&ghost])
+        .expect("ghost scope");
+    leases
+        .authorize_scope("vendor-scope", [&id])
+        .expect("vendor scope");
+    leases
+        .install_handoff(&handoff_document(&epoch_id, &[(&id, b"vendor-key")]), epoch)
+        .expect("install");
+    let endpoint = |base_url: &str| {
+        EndpointRoute::from_document(&serde_json::json!({
+            "model": "m",
+            "endpoint": {"baseUrl": base_url, "protocol": "openai-chat-completions"},
+            "auth": "api-key"
+        }))
+        .expect("route")
+        .1
+    };
+
+    let mut router_a = Router::with_leases(loopback_transport(), Arc::clone(&leases));
+    router_a
+        .add_endpoint_route_scoped(
+            "m-a",
+            endpoint("https://a.vendor.example/v1"),
+            "ghost-scope",
+        )
+        .expect("declare a");
+    let surface_a = router_a
+        .resolve("m-a")
+        .expect("resolve a")
+        .adapter
+        .target()
+        .clone();
+
+    // Router B's publish — a credential-free route with an empty scope
+    // table — must leave A's slice alone: the ghost-scoped surface still
+    // fails closed instead of slipping into the unscoped pool.
+    let mut router_b = Router::with_leases(loopback_transport(), Arc::clone(&leases));
+    router_b
+        .add_endpoint_route(
+            "m-b",
+            EndpointRoute::from_document(&serde_json::json!({
+                "model": "m-b",
+                "endpoint": {"baseUrl": "https://b.vendor.example/v1", "protocol": "openai-chat-completions"}
+            }))
+            .expect("route")
+            .1,
+        )
+        .expect("declare b");
+    let error = resolve_for_target(&leases, &surface_a)
+        .await
+        .expect_err("a scoped surface without a binding never resolves unscoped");
+    assert!(
+        error.to_string().contains("credential_lease_unavailable"),
+        "{error}"
+    );
+
+    // And a surface already bound by another owner refuses a different
+    // scope at declaration — resolution could never tell the two
+    // bindings apart, so the conflict dies before the route commits.
+    let error = router_b
+        .add_endpoint_route_scoped(
+            "m-c",
+            endpoint("https://a.vendor.example/v1"),
+            "vendor-scope",
+        )
+        .expect_err("a foreign-held surface refuses a conflicting scope");
+    assert!(error.to_string().contains("conflict"), "{error}");
+    assert!(router_b.resolve("m-c").is_err());
+}
+
+#[test]
+fn a_rejected_scope_table_authorizes_nothing() {
+    // The whole credentialScopes table validates and stages before any
+    // of it publishes: a malformed later entry refuses the document
+    // without leaving the earlier valid entry authorized — otherwise a
+    // rejected table would already have changed which credentials live
+    // routes resolve.
+    let id = uuid::Uuid::new_v4().to_string();
+    let leases = Leases::disconnected();
+    let document = serde_json::json!({
+        "credentialScopes": {"good": [id], "bad": "not-an-array"}
+    });
+    let error = leases
+        .authorize_scopes(&document)
+        .expect_err("a malformed entry rejects the table");
+    assert!(
+        error.to_string().contains("credential_scope_invalid"),
+        "{error}"
+    );
+    assert!(!leases.scope_authorized("good"));
+    let valid = serde_json::json!({"credentialScopes": {"good": [id]}});
+    leases.authorize_scopes(&valid).expect("a clean table");
+    assert!(leases.scope_authorized("good"));
+}
+
+#[test]
+fn the_binary_refuses_a_non_object_config_file() {
+    // A supplied config that is not a JSON object — an array, a scalar
+    // or `null` — carries no `routes` member; treating it as empty
+    // would start a silently unconfigured gateway, so startup refuses.
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (name, contents) in [("array", "[]"), ("scalar", "5"), ("null", "null")] {
+        let config = dir.path().join(format!("{name}.json"));
+        std::fs::write(&config, contents).expect("config");
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_fairliny"))
+            .args(["serve", "--no-meter", "--config"])
+            .arg(&config)
+            .output()
+            .expect("spawn fairliny");
+        assert!(!output.status.success(), "{name}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("JSON object"), "{name}: {stderr}");
+    }
+}
+
+#[tokio::test]
+async fn a_detached_scoped_adapter_fails_closed_when_its_binding_retires() {
+    // An adapter resolve() already returned keeps its bound surface.
+    // Replacing the route republishes a table that no longer binds it —
+    // but the retired surface must fail closed, never slip back into
+    // the unscoped pool the binding guarded it from.
+    let epoch = Arc::new(Epochs {
+        current: Mutex::new(uuid::Uuid::new_v4().to_string()),
+    });
+    let epoch_id = epoch.current.lock().unwrap().clone();
+    let id = uuid::Uuid::new_v4().to_string();
+    let leases = Arc::new(Leases::disconnected());
+    leases
+        .authorize_scope("vendor-scope", [&id])
+        .expect("scope");
+    leases
+        .install_handoff(&handoff_document(&epoch_id, &[(&id, b"vendor-key")]), epoch)
+        .expect("install");
+    let endpoint = |base_url: &str| {
+        EndpointRoute::from_document(&serde_json::json!({
+            "model": "m",
+            "endpoint": {"baseUrl": base_url, "protocol": "openai-chat-completions"},
+            "auth": "api-key"
+        }))
+        .expect("route")
+        .1
+    };
+    let mut router = Router::with_leases(loopback_transport(), Arc::clone(&leases));
+    router
+        .add_endpoint_route_scoped("m", endpoint("https://a.vendor.example/v1"), "vendor-scope")
+        .expect("declare");
+    let surface = router
+        .resolve("m")
+        .expect("resolve")
+        .adapter
+        .target()
+        .clone();
+    match resolve_for_target(&leases, &surface)
+        .await
+        .expect("scoped while bound")
+    {
+        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), "vendor-key"),
+        other => panic!("expected an api-key credential: {other:?}"),
+    }
+
+    // The replacement declares no scope, so the publish retires the old
+    // surface — the detached adapter fails closed on its next resolve.
+    let unscoped = EndpointRoute::from_document(&serde_json::json!({
+        "model": "m",
+        "endpoint": {"baseUrl": "https://b.vendor.example/v1", "protocol": "openai-chat-completions"}
+    }))
+    .expect("route")
+    .1;
+    router.add_endpoint_route("m", unscoped).expect("replace");
+    let error = resolve_for_target(&leases, &surface)
+        .await
+        .expect_err("a retired surface never falls back to unscoped");
+    assert!(
+        error.to_string().contains("credential_scope_retired"),
+        "{error}"
+    );
+
+    // And a still-scoped route keeps its credentials: retirement marks
+    // only the surfaces a republish dropped.
+    router
+        .add_endpoint_route_scoped(
+            "m2",
+            endpoint("https://a.vendor.example/v1"),
+            "vendor-scope",
+        )
+        .expect("the retired surface binds again under its scope");
+    match resolve_for_target(&leases, &surface)
+        .await
+        .expect("rebound scoped resolves")
+    {
+        a4mp::Credential::ApiKey(secret) => assert_eq!(secret.expose(), "vendor-key"),
+        other => panic!("expected an api-key credential: {other:?}"),
+    }
+}
+
+#[test]
+fn a_declared_route_and_a_prebound_adapter_never_share_a_model() {
+    // The prebound map resolves first and `models.list` projects both —
+    // a shared name would advertise two entries while every forward
+    // bypassed the declared scope. The collision refuses in both
+    // directions rather than splitting the projection.
+    let id = uuid::Uuid::new_v4().to_string();
+    let leases = Arc::new(Leases::disconnected());
+    leases
+        .authorize_scope("vendor-scope", [&id])
+        .expect("scope");
+    let endpoint = || {
+        EndpointRoute::from_document(&serde_json::json!({
+            "model": "m",
+            "endpoint": {"baseUrl": "https://a.vendor.example/v1", "protocol": "openai-chat-completions"},
+            "auth": "api-key"
+        }))
+        .expect("route")
+        .1
+    };
+    let adapter = || {
+        Arc::new(HungAdapter {
+            target: stub_target(),
+        }) as Arc<dyn a4mp::Adapter>
+    };
+
+    let mut router = Router::with_leases(loopback_transport(), Arc::clone(&leases));
+    router
+        .register_adapter("m", "upstream-m", adapter())
+        .expect("prebound");
+    let error = router
+        .add_endpoint_route_scoped("m", endpoint(), "vendor-scope")
+        .expect_err("a declared route refuses a prebound name");
+    assert!(error.to_string().contains("host-registered"), "{error}");
+    assert!(router.credential_scope("m").is_none());
+
+    let mut router = Router::with_leases(loopback_transport(), Arc::clone(&leases));
+    router
+        .add_endpoint_route_scoped("m", endpoint(), "vendor-scope")
+        .expect("declare");
+    let error = router
+        .register_adapter("m", "upstream-m", adapter())
+        .expect_err("a prebound adapter refuses a declared name");
+    assert!(error.to_string().contains("declared route"), "{error}");
+    assert_eq!(router.credential_scope("m"), Some("vendor-scope"));
 }

@@ -20,6 +20,7 @@ use fairliny_gateway::{
     meter::Meter,
     router::Router,
     service::Service,
+    transport::upstream_transport,
 };
 
 // Custody hands a CredentialHandoff document in over a process-local
@@ -30,6 +31,11 @@ let document = Leases::read_handoff(handoff_channel)?;
 leases.authorize_scope("openai-key", ["<credentialId>"])?;
 leases.install_handoff(&document, Arc::new(FileEpochSource::new(epoch_file)))?;
 
+// upstream_transport never follows redirects — a default reqwest client
+// would, and reqwest does not strip x-api-key/x-goog-api-key across
+// origins, so an authenticated route could leak its key to a host the
+// config never validated.
+let transport = upstream_transport()?;
 // with_leases wires the port as the resolver and registers each scoped
 // route's surface so the declared scope is enforced at resolution.
 let mut router = Router::with_leases(transport, leases);
