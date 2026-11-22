@@ -27,7 +27,7 @@ use a4mp::{
 use serde_json::Value;
 use url::Url;
 
-use crate::leases::{Leases, ProviderCredential, ScopeOwner, ScopedResolver};
+use crate::leases::{Leases, ProviderCredential, ScopeOwner, ScopedResolver, target_key};
 use crate::{Error, Result};
 
 /// The provider id endpoint routes bind under. An endpoint route names no
@@ -262,9 +262,11 @@ enum Declaration {
 }
 
 /// The credential-scope registration one declared route produced: the
-/// scope name plus the surface it was bound against — kept so a
-/// replacement drops the obsolete binding while a surface shared with
-/// another route keeps the binding that route still needs.
+/// scope name plus the surface it was bound against — the bound
+/// adapter's own target, what its request-time resolver scope will
+/// name, so a transforming custom factory registers under its output —
+/// kept so a replacement drops the obsolete binding while a surface
+/// shared with another route keeps the binding that route still needs.
 #[derive(Clone)]
 struct ScopedBinding {
     scope: String,
@@ -304,6 +306,10 @@ pub struct Router {
     /// Adapters the host bound itself — custom surfaces and test stubs.
     /// They skip profile checks because the host already owns the binding.
     prebound: BTreeMap<String, (Arc<dyn Adapter>, String)>,
+    /// The custody port unscoped binds resolve through — the resolver
+    /// the client was built with, kept beside it so resolution binds can
+    /// dispatch scoped and unscoped adapters off one router.
+    resolver: Arc<dyn CredentialResolver>,
     /// The lease port scoped surfaces register against. Present only
     /// when the router's resolver is the crate's own custody port —
     /// [`Router::with_leases`] wires both from one `Arc`.
@@ -340,8 +346,9 @@ impl Router {
         resolver: Arc<dyn CredentialResolver>,
     ) -> Self {
         Self {
-            client: a4mp::Client::new(catalog, transport.clone(), resolver),
+            client: a4mp::Client::new(catalog, transport.clone(), resolver.clone()),
             transport,
+            resolver,
             routes: BTreeMap::new(),
             endpoint_routes: BTreeMap::new(),
             scopes: BTreeMap::new(),
@@ -551,7 +558,9 @@ impl Router {
                 )));
             }
         }
-        let adapter = self.bind_profile(route).map_err(refuse)?;
+        let adapter = self
+            .bind_profile(route, Arc::clone(&self.resolver))
+            .map_err(refuse)?;
         self.check_scope_resolver(scope).map_err(refuse)?;
         Ok(adapter.target().clone())
     }
@@ -596,7 +605,9 @@ impl Router {
             }
             check_auth_header(&route.protocol, &route.auth, header).map_err(refuse)?;
         }
-        let adapter = self.bind_endpoint(route).map_err(refuse)?;
+        let adapter = self
+            .bind_endpoint(route, Arc::clone(&self.resolver))
+            .map_err(refuse)?;
         self.check_scope_resolver(scope).map_err(refuse)?;
         Ok(adapter.target().clone())
     }
@@ -862,10 +873,11 @@ impl Router {
             reason,
         };
         if let Some(route) = self.routes.get(model) {
-            let adapter = match self.scopes.get(model) {
-                Some(binding) => self.bind_scoped(&route.auth, binding).map_err(refused)?,
-                None => self.bind_profile(route).map_err(refused)?,
-            };
+            let adapter = self
+                .bind_declared(self.scopes.get(model), |resolver| {
+                    self.bind_profile(route, resolver)
+                })
+                .map_err(refused)?;
             return Ok(BoundRoute {
                 adapter,
                 upstream_model: route.upstream_model.clone(),
@@ -873,10 +885,11 @@ impl Router {
             });
         }
         if let Some(route) = self.endpoint_routes.get(model) {
-            let adapter = match self.scopes.get(model) {
-                Some(binding) => self.bind_scoped(&route.auth, binding).map_err(refused)?,
-                None => self.bind_endpoint(route).map_err(refused)?,
-            };
+            let adapter = self
+                .bind_declared(self.scopes.get(model), |resolver| {
+                    self.bind_endpoint(route, resolver)
+                })
+                .map_err(refused)?;
             return Ok(BoundRoute {
                 adapter,
                 upstream_model: route.upstream_model.clone(),
@@ -886,30 +899,79 @@ impl Router {
         Err(Error::UnknownModel(model.to_owned()))
     }
 
-    /// The scoped-route bind: the adapter goes up on the surface the
-    /// declaration registered, through a resolver pinned to the scope
-    /// the route declared. An adapter a later rebind detaches keeps
-    /// resolving against its own declaration — a rebound surface fails
-    /// it closed instead of handing it another scope's credentials.
-    /// The stored target already passed every declaration check, so
-    /// only the protocol-family bind remains.
-    fn bind_scoped(
+    /// The declared-route bind: the pinned-scope resolver for a scoped
+    /// route — pinned to this router's own [`ScopeOwner`] slice, the
+    /// binding identity the route declared under — or the router's own
+    /// custody port for an unscoped one. The bind feeds the factory the
+    /// route's declared input again, so a transforming custom factory
+    /// is never fed its own output; the adapter it returns must land
+    /// back on the surface the declaration registered — an output that
+    /// drifted off it would resolve against a surface no live binding
+    /// covers, so the drift refuses here rather than at first forward.
+    fn bind_declared(
         &self,
-        auth: &AuthKind,
-        binding: &ScopedBinding,
+        binding: Option<&ScopedBinding>,
+        bind: impl FnOnce(Arc<dyn CredentialResolver>) -> std::result::Result<Arc<dyn Adapter>, String>,
     ) -> std::result::Result<Arc<dyn Adapter>, String> {
-        let Some(leases) = &self.leases else {
-            return Err("credential scope requires the lease port".to_owned());
+        let resolver: Arc<dyn CredentialResolver> = match binding {
+            Some(binding) => {
+                let Some(leases) = &self.leases else {
+                    return Err("credential scope requires the lease port".to_owned());
+                };
+                Arc::new(ScopedResolver::new(
+                    Arc::clone(leases),
+                    self.scope_owner,
+                    binding.scope.clone(),
+                ))
+            }
+            None => Arc::clone(&self.resolver),
         };
-        let resolver: Arc<dyn CredentialResolver> = Arc::new(ScopedResolver::new(
-            Arc::clone(leases),
-            binding.scope.clone(),
-        ));
+        let adapter = bind(resolver)?;
+        if let Some(binding) = binding
+            && target_key(adapter.target()) != target_key(&binding.target)
+        {
+            return Err(
+                "the rebound adapter left the surface the declaration registered".to_owned(),
+            );
+        }
+        Ok(adapter)
+    }
+
+    /// The profile bind both declaration and resolution run: resolve
+    /// the profile, pick its target for the declared protocol (the
+    /// primary one when unpinned), materialize the declared variables
+    /// and bind through the catalog — the same computation a4mp's
+    /// `bind_provider_with` runs, spelled out so the input the factory
+    /// receives is always the route's own declaration and never the
+    /// transformed surface a previous bind returned.
+    fn bind_profile(
+        &self,
+        route: &Route,
+        resolver: Arc<dyn CredentialResolver>,
+    ) -> std::result::Result<Arc<dyn Adapter>, String> {
+        let profile = self
+            .client
+            .catalog()
+            .resolve(route.provider.as_str())
+            .ok_or_else(|| format!("unknown provider {}", route.provider))?;
+        let protocol = match &route.protocol {
+            Some(protocol) => protocol.clone(),
+            None => profile
+                .targets
+                .first()
+                .ok_or_else(|| format!("profile {} has no service targets", route.provider))?
+                .protocol
+                .clone(),
+        };
+        let target = profile
+            .try_target_for(&protocol, route.region.as_deref(), &bind_vars(&route.vars))
+            .map_err(|error| error.to_string())?;
+        check_cleartext_policy(&target.base_url, &route.auth)?;
         self.client
             .catalog()
             .bind(
-                binding.target.clone(),
-                auth.clone(),
+                target,
+                route.auth.clone(),
                 Arc::clone(&self.transport),
                 resolver,
                 None,
@@ -917,35 +979,28 @@ impl Router {
             .map_err(|error| error.to_string())
     }
 
-    /// The profile bind both declaration and resolution run.
-    fn bind_profile(&self, route: &Route) -> std::result::Result<Arc<dyn Adapter>, String> {
-        self.client
-            .bind_provider_with(
-                route.provider.as_str(),
-                route.protocol.clone(),
-                route.region.as_deref(),
-                route.auth.clone(),
-                &bind_vars(&route.vars),
-            )
-            .map_err(|error| error.to_string())
-    }
-
-    /// The endpoint bind both declaration and resolution run — the
-    /// cleartext-credential policy profile endpoints get inside a4mp,
-    /// restated for an explicit target `bind_target` never checks.
+    /// The endpoint counterpart of [`Self::bind_profile`] — the explicit
+    /// target the route declared, under the same cleartext-credential
+    /// policy profile endpoints get inside a4mp and `Catalog::bind`
+    /// never checks.
     fn bind_endpoint(
         &self,
         route: &EndpointRoute,
+        resolver: Arc<dyn CredentialResolver>,
     ) -> std::result::Result<Arc<dyn Adapter>, String> {
         check_cleartext_policy(&route.base_url, &route.auth)?;
         self.client
-            .bind_target(
+            .catalog()
+            .bind(
                 ServiceTarget::new(
                     CUSTOM_PROVIDER,
                     route.protocol.clone(),
                     route.base_url.clone(),
                 ),
                 route.auth.clone(),
+                Arc::clone(&self.transport),
+                resolver,
+                None,
             )
             .map_err(|error| error.to_string())
     }
@@ -1030,8 +1085,8 @@ fn check_base_url(url: &Url) -> std::result::Result<(), String> {
 /// The cleartext policy a4mp 0.4.0 applies to every profile endpoint
 /// (`a4mp::catalog::check_endpoint_url` and
 /// `check_cleartext_credential_policy`, both private, enforced inside
-/// `Client::bind_provider_with` but not `Client::bind_target`), restated
-/// once for endpoint routes:
+/// `Client::bind_provider_with` but not `Catalog::bind`), restated once
+/// for the explicit-target binds every route resolution runs:
 ///
 /// - `https` binds anywhere;
 /// - `http` binds only toward a private or loopback authority —

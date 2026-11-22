@@ -26,10 +26,13 @@ leases.authorize_scope("openai-key", ["<credentialId>"])?;  // host-authorized s
 leases.install_handoff(&document, epoch_source)?;       // FileEpochSource: custody-driven revocation
 let transport = fairliny_gateway::transport::upstream_transport()?;  // never follows redirects
 let mut router = Router::with_leases(transport, leases);  // registers scoped surfaces
-router.add_route("local", route)?;                      // Route: profile routes, `none` auth
-router.add_route_scoped("chat", scoped_route, "openai-key")?;  // api-key/bearer requires a scope
+router.add_route("local", route)?;                      // Route: profile routes; `none` auth on the lease port
+router.add_route_scoped("chat", scoped_route, "openai-key")?;  // api-key/bearer requires a scope on the lease port
 router.add_endpoint_route("vendor", endpoint_route)?;   // EndpointRoute: explicit baseUrl
 router.add_endpoint_route_scoped("vendor-chat", scoped_endpoint, "openai-key")?;  // authenticated endpoints scope too
+// A host-supplied resolver (Router::new / with_catalog) owns credential
+// dispatch instead: api-key/bearer declare unscoped through the same
+// add_route / add_endpoint_route calls there.
 // or register_adapter / with_catalog_leases
 let meter = Meter::open(state_root)?;                   // compose(root, binding) | unmetered()
 let service = Service::new(router, meter);
@@ -43,13 +46,18 @@ let exposition = fairliny_gateway::export::render(service.meter())?;
   handoff document arrives over a process-local channel; Fairliny never
   stores keys, and secret bytes never appear in serialized output,
   debug projections, logs or errors. One lease may carry several
-  vendors' credentials, so `api-key`/`bearer` routes must declare a
-  credential scope (`*_scoped` route calls, or `credentialScope` in a
-  routes document): the scope names a `Leases::authorize_scope`
-  authorization — the credential ids that route may resolve — and a
-  scope holding none fails closed. `Router::with_leases` registers each
-  scoped route's bound surface so resolution dispatches on the target,
-  never on the auth mechanism alone.
+  vendors' credentials, so on the lease port
+  (`Router::with_leases`/`with_catalog_leases`) `api-key`/`bearer`
+  routes must declare a credential scope (`*_scoped` route calls, or
+  `credentialScope` in a routes document): the scope names a
+  `Leases::authorize_scope` authorization — the credential ids that
+  route may resolve — and a scope holding none fails closed.
+  `Router::with_leases` registers each scoped route's bound surface so
+  resolution dispatches on the target, never on the auth mechanism
+  alone. A host-supplied resolver (`Router::new`/`with_catalog`) owns
+  its credential dispatch instead: `api-key`/`bearer` and the rest of
+  the auth vocabulary declare unscoped there, and a `credentialScope`
+  declaration refuses because no port can enforce it.
 - `Route` keeps its published construction fields — `provider`,
   `protocol`, `region`, `auth`, `upstream_model`, `vars`. Endpoint
   bindings live on `EndpointRoute` (`base_url`, `protocol`,

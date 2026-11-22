@@ -50,23 +50,28 @@ the admission counters and response settlement, `export` renders the
 Prometheus/OpenMetrics text a host mounts at its own `/metrics` route.
 `Service::new` is only the assembly of those three.
 
-### Migrating to 0.2 — credential scopes are required
+### Migrating to 0.2 — credential scopes on the lease port
 
-From the 0.2 release boundary, an `api-key`/`bearer` route must declare
-a credential scope. A 0.1 routes document or SDK caller that forwards a
-leased mechanism without one now refuses at declaration:
+From the 0.2 release boundary, an `api-key`/`bearer` route on the lease
+port must declare a credential scope. A 0.1 routes document or SDK
+caller on `Router::with_leases` that forwards a leased mechanism
+without one now refuses at declaration:
 
 - Routes documents: add the `credentialScopes` table authorizing each
   scope's `credentialId`s, and `credentialScope` on every
   `api-key`/`bearer` entry — including entries that shared one key
   before, which is exactly the sharing the boundary removes.
-- SDK callers: build the router with `Router::with_leases` (or
-  `with_catalog_leases`) and declare scoped routes through
+- SDK callers choose one of two configurations. On the lease port —
+  `Router::with_leases` (or `with_catalog_leases`) — an `api-key`/
+  `bearer` route declares its scope through
   `add_route_scoped`/`add_endpoint_route_scoped` or the document's
-  `credentialScope`. A scoped declaration on `Router::new`/
-  `with_catalog` refuses — a host-supplied resolver cannot enforce the
-  scope it would project. `add_route`/`add_endpoint_route` remain for
-  `none`-auth routes.
+  `credentialScope`; `add_route`/`add_endpoint_route` remain for the
+  routes that carry no credential. On a host-supplied resolver —
+  `Router::new`/`with_catalog` — the host owns credential dispatch, so
+  `api-key` and `bearer` routes declare unscoped through the same
+  unscoped calls and resolve through the host's port; a
+  `credentialScope` declaration refuses there because the resolver
+  cannot enforce the scope it would project.
 - Hosts driving the lease lifecycle themselves use `Leases::over_lease`
   and `Leases::install_lease`/`clear`, replacing the 0.1
   `over_slot`/`slot` surface — clear and replace now cover every scoped

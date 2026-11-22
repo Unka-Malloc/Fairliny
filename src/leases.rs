@@ -595,7 +595,7 @@ impl fmt::Debug for Leases {
 /// protocol family and base URL — the surface's identity, not the
 /// outward model name. Two outward names bound to the same surface share
 /// its credential scope.
-fn target_key(target: &ServiceTarget) -> String {
+pub(crate) fn target_key(target: &ServiceTarget) -> String {
     format!(
         "{}\u{1f}{:?}\u{1f}{}\u{1f}{:?}",
         target.provider.as_str(),
@@ -605,26 +605,30 @@ fn target_key(target: &ServiceTarget) -> String {
     )
 }
 
-/// A credential resolver pinned to the scope an adapter's surface was
-/// declared against.
+/// A credential resolver pinned to the binding an adapter's surface was
+/// declared under — its publishing owner's own table entry.
 ///
 /// The router binds a scoped route's adapter with this resolver instead
 /// of the bare port: the adapter resolves only while the surface still
-/// names the scope it was declared with. A rebind — the surface now
-/// serving another scope — or a retired binding fails it closed, so an
-/// adapter a route replacement detached can never inherit credentials
-/// the new declaration authorized for a different scope.
+/// names the scope it was declared with under the same [`ScopeOwner`].
+/// A sibling owner publishing the same surface-to-scope binding is a
+/// different binding — an adapter whose own owner's slice retired or
+/// rebound the surface fails closed even while the sibling's live
+/// binding keeps resolving, so a detached adapter can never ride a
+/// binding it was not declared under.
 pub struct ScopedResolver {
     leases: Arc<Leases>,
+    owner: ScopeOwner,
     scope: String,
 }
 
 impl ScopedResolver {
-    /// Pin resolutions to `scope` — the credential scope the bound
-    /// surface must still name for the adapter to resolve.
-    pub fn new(leases: Arc<Leases>, scope: impl Into<String>) -> Self {
+    /// Pin resolutions to `scope` under `owner` — the binding identity
+    /// the adapter's surface must still name for it to resolve.
+    pub fn new(leases: Arc<Leases>, owner: ScopeOwner, scope: impl Into<String>) -> Self {
         Self {
             leases,
+            owner,
             scope: scope.into(),
         }
     }
@@ -636,7 +640,7 @@ impl CredentialResolver for ScopedResolver {
         &self,
         scope: CredentialScope<'_>,
     ) -> std::result::Result<Credential, a4mp::Error> {
-        self.leases.resolve_pinned(&self.scope, scope)
+        self.leases.resolve_pinned(self.owner, &self.scope, scope)
     }
 }
 
@@ -678,29 +682,38 @@ impl Leases {
     }
 
     /// The pinned half of resolution: the surface must still name
-    /// `declared` — the scope the adapter was bound against. A surface
-    /// rebound to another scope or retired altogether fails closed; an
-    /// adapter detached by the rebind can never inherit credentials its
-    /// declaration did not authorize.
+    /// `declared` — the scope the adapter was bound against — in the
+    /// resolver's own owner's slice. Another owner's binding on the same
+    /// surface is a different binding: an adapter whose own slice
+    /// retired or rebound the surface fails closed rather than riding
+    /// the sibling's live claim. An unauthenticated request never
+    /// consults the table — it carries no credential to guard.
     fn resolve_pinned(
         &self,
+        owner: ScopeOwner,
         declared: &str,
         scope: CredentialScope<'_>,
     ) -> std::result::Result<Credential, a4mp::Error> {
-        let scoped = match self.bound_scope(scope.target)? {
-            Some(bound) if bound == declared => Some(bound),
-            Some(_) => {
-                return Err(a4mp::Error::Credential(
-                    "credential_scope_conflict".to_owned(),
-                ));
-            }
-            None => {
-                return Err(a4mp::Error::Credential(
-                    "credential_scope_retired".to_owned(),
-                ));
-            }
+        if matches!(scope.auth, AuthKind::None) {
+            return Ok(Credential::None);
+        }
+        let bound = {
+            let tables = lock(&self.target_scopes);
+            tables
+                .get(&owner)
+                .and_then(|slice| slice.get(&target_key(scope.target)))
+                .cloned()
+                .flatten()
         };
-        self.resolve_kind(scoped, &scope)
+        match bound {
+            Some(bound) if bound == declared => self.resolve_kind(Some(bound), &scope),
+            Some(_) => Err(a4mp::Error::Credential(
+                "credential_scope_conflict".to_owned(),
+            )),
+            None => Err(a4mp::Error::Credential(
+                "credential_scope_retired".to_owned(),
+            )),
+        }
     }
 
     /// The shared tail of every resolution: the leased-kind check, the
@@ -768,11 +781,17 @@ impl CredentialResolver for Leases {
     /// from. Never-bound surfaces answer from the unscoped slot. One absolute
     /// expiry covers every slot the install produced: past the install's
     /// deadline the answer is `credential_lease_expired`, so a scope
-    /// materialized late can never outlive the handoff it came from.
+    /// materialized late can never outlive the handoff it came from. An
+    /// `AuthKind::None` request carries no credential to guard: it
+    /// answers `Credential::None` before the binding table is consulted,
+    /// so a tombstoned surface never fails an unauthenticated forward.
     async fn resolve(
         &self,
         scope: CredentialScope<'_>,
     ) -> std::result::Result<Credential, a4mp::Error> {
+        if matches!(scope.auth, AuthKind::None) {
+            return Ok(Credential::None);
+        }
         let scoped = self.bound_scope(scope.target)?;
         self.resolve_kind(scoped, &scope)
     }
