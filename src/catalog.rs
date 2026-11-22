@@ -191,11 +191,12 @@ impl CatalogSync {
     }
 
     /// Fetch the configured source once: an `If-None-Match`
-    /// revalidation when the cache holds a revision, a `304` answering
-    /// `unchanged` with no write, a `200` validating and replacing the
-    /// cache atomically, and any failure keeping — and reporting — the
-    /// last valid catalog. Without a configured source, or with no valid
-    /// catalog to keep, the refresh refuses.
+    /// revalidation when the cache holds a revision this same source
+    /// wrote, a `304` answering `unchanged` with no write, a `200`
+    /// validating and replacing the cache atomically, and any failure
+    /// keeping — and reporting — the last valid catalog. Without a
+    /// configured source, or with no valid catalog to keep, the refresh
+    /// refuses.
     pub async fn refresh(&self) -> Result<Value> {
         self.refresh_with(async |url, revision| fetch(&self.client, url, revision).await)
             .await
@@ -222,12 +223,17 @@ impl CatalogSync {
         // exactly as `read` serves under it.
         let pin = self.pin();
         // An invalid cached document is replaceable; an unsafe
-        // filesystem read is not.
+        // filesystem read is not. The last valid catalog falls back as
+        // `stale` whatever source wrote it; only the conditional is
+        // source-bound — a revision another URL issued never leaves in
+        // `If-None-Match`.
         let cache = read_cache_text(&path)?
             .as_deref()
-            .and_then(|text| decode_cache(text, pin).ok())
-            .filter(|cache| cache.source == source.url.as_str());
-        let revision = cache.as_ref().map(|cache| cache.catalog.revision.as_str());
+            .and_then(|text| decode_cache(text, pin).ok());
+        let revision = cache
+            .as_ref()
+            .filter(|cache| cache.source == source.url.as_str())
+            .map(|cache| cache.catalog.revision.as_str());
         let updated = fetch(&source.url, revision).await.and_then(|catalog| {
             if let Some(catalog) = &catalog {
                 validate(catalog, pin)?;

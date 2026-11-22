@@ -531,6 +531,41 @@ async fn a_lost_reply_fails_the_serve_while_input_stays_open() {
 }
 
 #[tokio::test]
+async fn a_source_change_keeps_the_last_valid_catalog_as_stale() {
+    // The configured URL moved to a source that cannot be reached —
+    // `catalog.read` still serves the previous valid cache, and the
+    // refresh falls back to it as `stale` rather than reporting
+    // `catalog_refresh_failed` with nothing kept. The absent
+    // `If-None-Match` is the other half of the rule: a revision the old
+    // URL issued never validates the new source.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = closed.local_addr().expect("addr");
+    drop(closed);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_cache(dir.path(), "https://catalog.example/v1/catalog");
+    let source = CatalogSource::from_document(&json!({
+        "source": format!("https://{addr}/catalog")
+    }))
+    .expect("source");
+    let sync = CatalogSync::new(dir.path())
+        .expect("sync")
+        .with_source(source)
+        .with_client_builder(reqwest::Client::builder().no_proxy())
+        .expect("client");
+    let service = service_with(Some(sync));
+
+    let reply = dispatch(&service, "catalog.refresh", json!({})).await;
+    assert_eq!(reply["status"], "stale", "{reply}");
+    assert_eq!(reply["reasonCode"], "catalog_refresh_failed", "{reply}");
+    assert_eq!(reply["catalog"]["revision"], REVISION, "{reply}");
+
+    let reply = dispatch(&service, "catalog.read", json!({})).await;
+    assert_eq!(reply["status"], "cached", "{reply}");
+    assert_eq!(reply["catalog"]["revision"], REVISION, "{reply}");
+}
+
+#[tokio::test]
 async fn a_lease_backed_service_serves_discovery_and_catalog_together() {
     // The sidecar's real shape — a lease-backed router plus a
     // configured sync — answers both projections on one dispatch
