@@ -354,8 +354,10 @@ mod tests {
     fn handoff_bytes() -> Vec<u8> {
         let credential = credential_lease::LeasedCredential::new(
             uuid::Uuid::new_v4().to_string(),
-            credential_lease::SecretBytes::try_from_bytes(b"test-material".to_vec())
-                .expect("secret"),
+            credential_lease::SecretBytes::try_from_bytes(
+                uuid::Uuid::new_v4().to_string().into_bytes(),
+            )
+            .expect("secret"),
             None,
         )
         .expect("credential");

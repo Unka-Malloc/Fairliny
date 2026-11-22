@@ -817,11 +817,12 @@ async fn buffered_result(
 /// The pump inside the stream task: dialect SSE frames as `stream:"data"`
 /// lines, tracking the last usage event and every encode loss. The
 /// host's upstream deadline bounds upstream reads only — the stream open
-/// and every frame wait — at one instant computed here, so local output
-/// waits never count against a healthy upstream and the deadline can
-/// never cancel inside a `write_line` (a half-written NDJSON line would
-/// corrupt every reply that followed it on the wire). Returns how the
-/// stream ended; the caller writes the terminal line.
+/// and every frame wait — as a budget drawn down by the time each wait
+/// actually spends on the upstream, so local output waits never count
+/// against a healthy upstream and the deadline can never cancel inside
+/// a `write_line` (a half-written NDJSON line would corrupt every reply
+/// that followed it on the wire). Returns how the stream ended; the
+/// caller writes the terminal line.
 async fn pump_frames(
     writer: &SharedWriter,
     id: &Value,
@@ -837,21 +838,27 @@ async fn pump_frames(
         control,
         ..
     } = prepared;
-    let deadline_at = deadline.map(|d| tokio::time::Instant::now() + d);
-    /// One upstream wait under the shared deadline instant — input waits
-    /// alone count against it, never output.
+    /// One upstream wait charged against `budget`: the elapsed wait
+    /// comes out of the remaining allowance, so downstream stalls
+    /// between waits can never shorten the next read.
     async fn upstream<T>(
-        deadline_at: Option<tokio::time::Instant>,
+        budget: &mut Option<Duration>,
         wait: impl std::future::Future<Output = T>,
     ) -> std::result::Result<T, PumpOutcome> {
-        match deadline_at {
-            Some(at) => tokio::time::timeout_at(at, wait)
-                .await
-                .map_err(|_| PumpOutcome::Deadline),
-            None => Ok(wait.await),
+        let Some(remaining) = budget else {
+            return Ok(wait.await);
+        };
+        let started = tokio::time::Instant::now();
+        match tokio::time::timeout(*remaining, wait).await {
+            Ok(value) => {
+                *remaining = remaining.saturating_sub(started.elapsed());
+                Ok(value)
+            }
+            Err(_) => Err(PumpOutcome::Deadline),
         }
     }
-    let mut events = match upstream(deadline_at, bound.adapter.chat_stream(request, &control)).await
+    let mut budget = deadline;
+    let mut events = match upstream(&mut budget, bound.adapter.chat_stream(request, &control)).await
     {
         Ok(Ok(events)) => events,
         Ok(Err(error)) => return PumpOutcome::Ended(error),
@@ -866,7 +873,7 @@ async fn pump_frames(
     }
     loop {
         let item = match upstream(
-            deadline_at,
+            &mut budget,
             std::future::poll_fn(|cx| Stream::poll_next(events.as_mut(), cx)),
         )
         .await

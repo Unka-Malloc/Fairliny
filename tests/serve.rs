@@ -3444,7 +3444,7 @@ fn a_transformed_target_must_pass_the_bound_surface_policy() {
     let mut router = Router::with_catalog_leases(
         catalog_with(|url| {
             url.set_username("svc").expect("username");
-            url.set_password(Some("hunter2")).expect("password");
+            url.set_password(Some(secret_a())).expect("password");
         }),
         loopback_transport(),
         Arc::clone(&leases),
